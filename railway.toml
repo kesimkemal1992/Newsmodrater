@@ -1,0 +1,48 @@
+# ════════════════════════════════════════════════════════════════
+# railway.toml  —  Railway deployment config
+# ════════════════════════════════════════════════════════════════
+
+[build]
+builder = "NIXPACKS"
+
+[deploy]
+startCommand = "python main.py"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 5
+
+# Persistent volume for session file + SQLite DB
+# Set this in Railway dashboard: Mount /data → /app/data
+# Then set DB_PATH=/app/data/memory.db and SESSION_NAME=/app/data/manager_session
+
+# ════════════════════════════════════════════════════════════════
+# render.yaml  —  Render deployment config (paste into render.yaml)
+# ════════════════════════════════════════════════════════════════
+# services:
+#   - type: worker
+#     name: telegram-manager
+#     runtime: python
+#     buildCommand: pip install -r requirements.txt
+#     startCommand: python main.py
+#     envVars:
+#       - key: TELEGRAM_API_ID
+#         sync: false
+#       - key: TELEGRAM_API_HASH
+#         sync: false
+#       - key: TELEGRAM_PHONE
+#         sync: false
+#       - key: GEMINI_API_KEY
+#         sync: false
+#       - key: GROQ_API_KEY
+#         sync: false
+#       - key: SOURCE_CHANNELS
+#         sync: false
+#       - key: DEST_CHANNEL
+#         sync: false
+#       - key: DB_PATH
+#         value: /var/data/memory.db
+#       - key: SESSION_NAME
+#         value: /var/data/manager_session
+#     disk:
+#       name: bot-data
+#       mountPath: /var/data
+#       sizeGB: 1
