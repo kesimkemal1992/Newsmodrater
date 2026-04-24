@@ -1,0 +1,213 @@
+# 🤖 Telegram Self-Learning Channel Manager
+
+A production-grade Telegram channel manager using a **user account (Telethon)**
+with dual-layer AI analysis (Gemini 2.5 Flash + Groq fallback), watermark
+detection, category filtering, and human-behavior simulation.
+
+---
+
+## 🗂️ Architecture
+
+```
+telegram_manager/
+├── main.py          ← Entry point, config, shutdown handling
+├── scraper.py       ← Telethon scraper + human-behaviour simulation
+├── ai_engine.py     ← Gemini 2.5 Flash (primary) + Groq (fallback)
+├── memory.py        ← SQLite deduplication + posted log + channel state
+├── requirements.txt
+├── .env.example     ← Copy to .env and fill in
+└── railway.toml     ← Railway / Render deployment config
+```
+
+---
+
+## ⚡ Key Features
+
+| Feature | Detail |
+|---|---|
+| **Dual AI Layer** | Gemini 2.5 Flash → Groq Vision (auto fallback) |
+| **Watermark Detection** | AI rejects images with other channels' logos |
+| **Category Filter** | Strict relevance check per your channel niche |
+| **Date Validation** | Rejects charts/news older than 18 hours |
+| **Anti-Duplication** | SHA-256 hash of text + image bytes, 30-day memory |
+| **Amharic-English Format** | Professional code-switched posts |
+| **Smart Hashtags** | Only affected pairs, e.g. `#XAUUSD #USD` |
+| **Human Behaviour** | Random delays (8–30s) + typing indicator |
+| **Self-Learning** | Logs every decision for future analytics |
+
+---
+
+## 🚀 Quick Start (Local)
+
+### 1. Clone & install
+
+```bash
+git clone <your-repo>
+cd telegram_manager
+pip install -r requirements.txt
+```
+
+### 2. Configure
+
+```bash
+cp .env.example .env
+nano .env   # Fill in all values
+```
+
+### 3. First Run — Generate Session
+
+```bash
+python main.py
+```
+Telethon will prompt for your phone number and the OTP code Telegram sends.
+After login, a `manager_session.session` file is created — **keep it safe**.
+
+### 4. Run
+
+```bash
+python main.py
+```
+
+---
+
+## 🔑 Getting API Credentials
+
+### Telegram User Account (Required)
+1. Go to [my.telegram.org/apps](https://my.telegram.org/apps)
+2. Log in with your phone number
+3. Create a new application → copy **App api_id** and **App api_hash**
+
+### Gemini API Key
+- [aistudio.google.com](https://aistudio.google.com/) → Get API Key (free tier available)
+
+### Groq API Key
+- [console.groq.com](https://console.groq.com/) → Create API Key (free tier: fast)
+
+---
+
+## ☁️ Deploy on Railway (Recommended)
+
+Railway gives you a persistent disk — essential for the `.session` file and SQLite DB.
+
+### Steps:
+1. **Upload session file first** (see below)
+2. Push code to GitHub
+3. Connect repo in [railway.app](https://railway.app)
+4. Add a **Volume** → mount at `/app/data`
+5. Set all environment variables in Railway dashboard:
+
+```
+TELEGRAM_API_ID       = your_id
+TELEGRAM_API_HASH     = your_hash
+TELEGRAM_PHONE        = +251911234567
+SESSION_NAME          = /app/data/manager_session
+DB_PATH               = /app/data/memory.db
+GEMINI_API_KEY        = ...
+GROQ_API_KEY          = ...
+SOURCE_CHANNELS       = @ch1,@ch2,@ch3
+DEST_CHANNEL          = @your_channel
+CHANNEL_CATEGORY      = Forex, Gold, Commodities...
+```
+
+6. Deploy → the worker starts polling automatically.
+
+### ⚠️ Session File Upload (Critical!)
+Telethon cannot do interactive OTP login on Railway. Do this locally first:
+
+```bash
+# Run once locally to generate session:
+python main.py
+# Copy the .session file to your Railway volume via Railway CLI:
+railway run -- bash -c "cp manager_session.session /app/data/"
+```
+
+Or use the [Railway CLI](https://docs.railway.app/develop/cli):
+```bash
+railway login
+railway run python main.py   # Login interactively, generates session
+railway up                   # Deploy with the session already in /app/data
+```
+
+---
+
+## ☁️ Deploy on Render
+
+1. Create a **Background Worker** service (not Web Service)
+2. Connect your GitHub repo
+3. Set **Build Command**: `pip install -r requirements.txt`
+4. Set **Start Command**: `python main.py`
+5. Add a **Disk** → Mount Path: `/var/data`, Size: 1 GB
+6. Set all env vars (use `/var/data/memory.db` and `/var/data/manager_session`)
+7. **Generate session locally first**, upload to Render disk via SSH
+
+---
+
+## 🧠 How the AI Makes Decisions
+
+```
+New Message
+    │
+    ▼
+[Dedup Check] ─── duplicate? → SKIP
+    │
+    ▼
+[Gemini 2.5 Flash]
+  • Vision: watermark scan
+  • Text: relevance + date check
+  • Decision: approve / reject + format
+    │
+    ├── FAILED? → [Groq Vision Fallback]
+    │                  same checks
+    │
+    ▼
+Approved? → [Human Delay] → [Typing...] → POST ✅
+Rejected? → LOG + SKIP ❌
+```
+
+---
+
+## 📊 AI Quality Gates (Any ONE = Reject)
+
+1. **Watermark** — Another channel's logo/username visible in image
+2. **Off-Topic** — Content outside channel category
+3. **Old Content** — Timestamp > 18 hours ago
+4. **Low Value** — Generic statement with no levels or insight
+5. **Unverifiable** — Wild claims, no source
+
+---
+
+## 🔧 Tuning
+
+| Env Var | Default | Effect |
+|---|---|---|
+| `POLL_INTERVAL` | 60s | How often to check channels |
+| `MIN_DELAY` | 8s | Min wait before posting |
+| `MAX_DELAY` | 30s | Max wait before posting |
+| `LOOKBACK_HOURS` | 2 | How far back on first run |
+| `HASH_TTL_DAYS` | 30 | Dedup memory window |
+| `CHANNEL_CATEGORY` | Forex/Gold/... | AI filter context |
+
+---
+
+## 📝 Logs
+
+```
+bot.log       ← Full rotating log file
+stdout        ← Railway/Render sees this
+```
+
+Each poll cycle logs:
+- Messages found per channel
+- AI verdict (approved/rejected + reason + engine used)
+- Posting confirmation with destination message ID
+
+---
+
+## ⚠️ Important Notes
+
+- **User Account Risk**: Using a personal Telegram account for automation
+  carries a small ban risk. Use a dedicated account, not your main one.
+- **Rate Limits**: The bot already respects FloodWait errors. Keep
+  `POLL_INTERVAL ≥ 60` and `MIN_DELAY ≥ 8` for safety.
+- **Session Security**: The `.session` file = full access to your account.
+  Never commit it to Git (it's in `.gitignore`).
