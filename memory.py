@@ -1,11 +1,13 @@
 """
-memory.py — Persistent memory & anti-duplication engine.
+memory.py — Persistent memory, anti-duplication, and scheduler state engine.
 
 Stores:
   • SHA-256 hashes of every processed message (text + image)
   • Posted message metadata for analytics
-  • Channel category last-seen message IDs
-  • Scheduled reminders (calendar events) with sent status
+  • Channel state (last-seen message IDs)
+  • Daily briefing post IDs (for reminder reply threading)
+  • Daily reminder count (anti-spam: max 2 per day)
+  • Reminder schedule state
 """
 
 import asyncio
@@ -14,7 +16,6 @@ import json
 import logging
 import time
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Optional
 
 import aiosqlite
@@ -47,21 +48,29 @@ CREATE TABLE IF NOT EXISTS channel_stats (
     last_seen   REAL
 );
 
--- NEW: tracks scheduled reminders for High Impact calendar events
-CREATE TABLE IF NOT EXISTS reminders (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    event_key       TEXT UNIQUE NOT NULL,   -- "<event_name>|<news_time_utc>" normalised
-    event_name      TEXT NOT NULL,
-    news_time_utc   TEXT NOT NULL,          -- "HH:MM UTC"
-    dest_msg_id     INTEGER NOT NULL,       -- the calendar post to reply to
-    reminder_sent   INTEGER DEFAULT 0,      -- 0 = pending, 1 = sent, 2 = skipped
-    created_at      REAL NOT NULL,
-    sent_at         REAL
+-- Tracks the morning daily briefing post (so reminders can reply to it)
+CREATE TABLE IF NOT EXISTS daily_briefings (
+    date_str        TEXT PRIMARY KEY,   -- YYYY-MM-DD in EAT timezone
+    dest_msg_id     INTEGER NOT NULL,   -- Telegram message ID to reply to
+    posted_at       REAL NOT NULL,
+    events_json     TEXT                -- serialised list of events
 );
 
-CREATE INDEX IF NOT EXISTS idx_hashes_expires    ON content_hashes(expires_at);
-CREATE INDEX IF NOT EXISTS idx_posted_source     ON posted_messages(source_channel, source_msg_id);
-CREATE INDEX IF NOT EXISTS idx_reminders_pending ON reminders(reminder_sent, news_time_utc);
+-- Tracks how many reminders have been sent today (max 2 per day)
+CREATE TABLE IF NOT EXISTS daily_reminders (
+    date_str        TEXT PRIMARY KEY,   -- YYYY-MM-DD in EAT timezone
+    count           INTEGER DEFAULT 0,
+    last_sent       REAL
+);
+
+-- Tracks which events have already had their reminder sent
+CREATE TABLE IF NOT EXISTS sent_reminders (
+    event_key       TEXT PRIMARY KEY,   -- "{date_str}_{event_name}_{currency}"
+    sent_at         REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_hashes_expires ON content_hashes(expires_at);
+CREATE INDEX IF NOT EXISTS idx_posted_source  ON posted_messages(source_channel, source_msg_id);
 """
 
 
@@ -103,13 +112,6 @@ class MemoryManager:
         if image_data:
             h.update(image_data)
         return h.hexdigest()
-
-    @staticmethod
-    def make_event_key(event_name: str, news_time_utc: str) -> str:
-        """Normalised dedup key for a reminder."""
-        name = " ".join(event_name.lower().strip().split())
-        time_ = news_time_utc.lower().replace(" utc", "").strip()
-        return f"{name}|{time_}"
 
     # ── Deduplication ──────────────────────────────────────────────────────────
     async def is_duplicate(self, content_hash: str) -> bool:
@@ -182,66 +184,67 @@ class MemoryManager:
             )
             await self._db.commit()
 
-    # ── Reminder management ────────────────────────────────────────────────────
+    # ── Daily Briefing Tracking ────────────────────────────────────────────────
+    async def save_daily_briefing(self, date_str: str, dest_msg_id: int, events: list):
+        """Store the morning briefing message ID so reminders can reply to it."""
+        async with self._lock:
+            await self._db.execute(
+                """INSERT OR REPLACE INTO daily_briefings
+                   (date_str, dest_msg_id, posted_at, events_json)
+                   VALUES (?, ?, ?, ?)""",
+                (date_str, dest_msg_id, time.time(), json.dumps(events, ensure_ascii=False)),
+            )
+            await self._db.commit()
+        log.info(f"Daily briefing saved: date={date_str}, msg_id={dest_msg_id}")
 
-    async def reminder_exists(self, event_key: str) -> bool:
-        """True if this event already has a reminder scheduled or sent."""
+    async def get_daily_briefing_msg_id(self, date_str: str) -> Optional[int]:
+        """Return the Telegram message ID of today's briefing post (for reply threading)."""
         async with self._db.execute(
-            "SELECT 1 FROM reminders WHERE event_key=?", (event_key,)
+            "SELECT dest_msg_id FROM daily_briefings WHERE date_str=?", (date_str,)
+        ) as cur:
+            row = await cur.fetchone()
+        return row["dest_msg_id"] if row else None
+
+    async def has_daily_briefing(self, date_str: str) -> bool:
+        """Check if morning briefing was already posted today."""
+        msg_id = await self.get_daily_briefing_msg_id(date_str)
+        return msg_id is not None
+
+    # ── Reminder Anti-Spam ────────────────────────────────────────────────────
+    async def get_reminder_count_today(self, date_str: str) -> int:
+        """Return how many reminders have been sent today."""
+        async with self._db.execute(
+            "SELECT count FROM daily_reminders WHERE date_str=?", (date_str,)
+        ) as cur:
+            row = await cur.fetchone()
+        return row["count"] if row else 0
+
+    async def increment_reminder_count(self, date_str: str):
+        """Increment the reminder counter for today (called after each reminder sent)."""
+        async with self._lock:
+            await self._db.execute(
+                """INSERT INTO daily_reminders (date_str, count, last_sent)
+                   VALUES (?, 1, ?)
+                   ON CONFLICT(date_str) DO UPDATE
+                   SET count=count+1, last_sent=excluded.last_sent""",
+                (date_str, time.time()),
+            )
+            await self._db.commit()
+
+    async def has_reminder_been_sent(self, event_key: str) -> bool:
+        """Check if a reminder for a specific event has already been sent."""
+        async with self._db.execute(
+            "SELECT 1 FROM sent_reminders WHERE event_key=?", (event_key,)
         ) as cur:
             row = await cur.fetchone()
         return row is not None
 
-    async def schedule_reminder(
-        self,
-        event_name: str,
-        news_time_utc: str,
-        dest_msg_id: int,
-    ) -> bool:
-        """
-        Insert a pending reminder. Returns True if inserted, False if duplicate.
-        """
-        key = self.make_event_key(event_name, news_time_utc)
-        if await self.reminder_exists(key):
-            log.info(f"[REMINDER] Already exists for key='{key}' — skipping.")
-            return False
-
-        async with self._lock:
-            try:
-                await self._db.execute(
-                    """INSERT INTO reminders
-                       (event_key, event_name, news_time_utc, dest_msg_id,
-                        reminder_sent, created_at)
-                       VALUES (?, ?, ?, ?, 0, ?)""",
-                    (key, event_name, news_time_utc, dest_msg_id, time.time()),
-                )
-                await self._db.commit()
-                log.info(
-                    f"[REMINDER] Scheduled → event='{event_name}' "
-                    f"time='{news_time_utc}' reply_to={dest_msg_id}"
-                )
-                return True
-            except Exception as exc:
-                log.error(f"[REMINDER] Insert failed: {exc}")
-                return False
-
-    async def get_pending_reminders(self) -> list[dict]:
-        """Return all reminders not yet sent or skipped."""
-        async with self._db.execute(
-            """SELECT id, event_key, event_name, news_time_utc, dest_msg_id
-               FROM reminders
-               WHERE reminder_sent = 0
-               ORDER BY news_time_utc ASC""",
-        ) as cur:
-            rows = await cur.fetchall()
-        return [dict(r) for r in rows]
-
-    async def mark_reminder_sent(self, reminder_id: int, status: int = 1):
-        """status: 1=sent, 2=skipped (too late / past)."""
+    async def mark_reminder_sent(self, event_key: str):
+        """Mark that a reminder for this event has been sent."""
         async with self._lock:
             await self._db.execute(
-                "UPDATE reminders SET reminder_sent=?, sent_at=? WHERE id=?",
-                (status, time.time(), reminder_id),
+                "INSERT OR IGNORE INTO sent_reminders (event_key, sent_at) VALUES (?, ?)",
+                (event_key, time.time()),
             )
             await self._db.commit()
 
@@ -249,13 +252,17 @@ class MemoryManager:
     async def _evict_expired(self):
         now = time.time()
         async with self._lock:
-            result = await self._db.execute(
+            cur = await self._db.execute(
                 "DELETE FROM content_hashes WHERE expires_at<=?", (now,)
             )
-            count = result.rowcount
+            # Also clean up old reminder records (older than 7 days)
+            old_threshold = now - (7 * 86_400)
+            await self._db.execute(
+                "DELETE FROM sent_reminders WHERE sent_at<?", (old_threshold,)
+            )
             await self._db.commit()
-        if count:
-            log.info(f"Evicted {count} expired content hashes.")
+        if cur.rowcount:
+            log.info(f"Evicted {cur.rowcount} expired content hashes.")
 
     # ── Stats ──────────────────────────────────────────────────────────────────
     async def stats(self) -> dict:
@@ -272,13 +279,17 @@ class MemoryManager:
             (time.time() - 86_400,),
         ) as cur:
             posted_24h = (await cur.fetchone())["n"]
-        async with self._db.execute(
-            "SELECT COUNT(*) AS n FROM reminders WHERE reminder_sent = 0"
-        ) as cur:
-            pending_reminders = (await cur.fetchone())["n"]
+
+        # Get today's reminder count
+        from datetime import datetime, timezone
+        import pytz
+        eat = pytz.timezone("Africa/Addis_Ababa")
+        today_str = datetime.now(eat).strftime("%Y-%m-%d")
+        pending_reminders = await self.get_reminder_count_today(today_str)
+
         return {
-            "tracked_hashes":    hashes,
-            "total_posted":      posted,
-            "posted_last_24h":   posted_24h,
+            "tracked_hashes": hashes,
+            "total_posted": posted,
+            "posted_last_24h": posted_24h,
             "pending_reminders": pending_reminders,
         }
