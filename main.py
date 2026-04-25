@@ -1,16 +1,21 @@
 """
 main.py — AXIOM INTEL Telegram Manager
-Uses StringSession so no interactive OTP is needed on Railway/Render.
+Institutional Senior Trader Edition
 
-First time setup:
-    python generate_session.py   ← run locally, get SESSION_STRING
+Architecture:
+  • Poll loop     — scrapes Telegram sources every POLL_INTERVAL seconds
+  • Reminder loop — checks for upcoming events every 60s (separate coroutine)
+  • Both run concurrently via asyncio.gather
+
+Setup:
+    python generate_session.py   ← run locally once, get SESSION_STRING
     Paste SESSION_STRING into Railway environment variables.
+    Set GEMINI_API_KEY, GROQ_API_KEY, SOURCE_CHANNELS, DEST_CHANNEL.
     Deploy. Done.
 
-New in this version:
-    CALENDAR_SOURCE  — optional dedicated channel for ForexFactory/Calendar
-                       screenshots. High Impact (Red Folder) events trigger
-                       an automated reminder 10 minutes before release.
+Optional env vars:
+    CALENDAR_SOURCE=forex_factory   — enable ForexFactory daily briefings
+    POLL_INTERVAL=60                — seconds between Telegram scrape cycles
 """
 
 import asyncio
@@ -39,7 +44,7 @@ logging.basicConfig(
 log = logging.getLogger("main")
 
 
-# ─── Config ────────────────────────────────────────────────────────────────────
+# ─── Config helpers ────────────────────────────────────────────────────────────
 def _require(key: str) -> str:
     val = os.environ.get(key, "").strip()
     if not val:
@@ -48,39 +53,41 @@ def _require(key: str) -> str:
     return val
 
 
+# ─── Config ────────────────────────────────────────────────────────────────────
 CONFIG = {
     # Telegram credentials
     "api_id":         int(_require("TELEGRAM_API_ID")),
     "api_hash":       _require("TELEGRAM_API_HASH"),
     "phone":          os.getenv("TELEGRAM_PHONE", ""),
 
-    # Session
+    # Session (StringSession preferred — no OTP on server)
     "session_string": os.getenv("SESSION_STRING", ""),
     "session_name":   os.getenv("SESSION_NAME", "manager_session"),
 
-    # Channels — regular news sources
+    # Channels
     "source_channels": [
         c.strip() for c in _require("SOURCE_CHANNELS").split(",") if c.strip()
     ],
     "dest_channel": _require("DEST_CHANNEL"),
 
-    # NEW: dedicated calendar/ForexFactory channel (optional)
-    # Set CALENDAR_SOURCE to a Telegram channel username or ID.
-    # If not set, calendar scanning is disabled.
-    "calendar_source": os.getenv("CALENDAR_SOURCE", "").strip(),
-
     # AI keys
     "gemini_api_key": _require("GEMINI_API_KEY"),
     "groq_api_key":   _require("GROQ_API_KEY"),
 
-    # Channel focus (injected into every news AI prompt)
+    # Channel focus (injected into every AI moderation prompt)
     "channel_category": os.getenv(
         "CHANNEL_CATEGORY",
         "Geopolitical events (wars, sanctions, elections), Central Bank policy "
-        "(FED, ECB, BOE, BOJ), Macroeconomic data (CPI, NFP, GDP), "
-        "Gold (XAU) safe-haven flows, Oil (WTI/Brent) supply disruptions. "
+        "(FED, ECB, BOE, BOJ), Macroeconomic data (CPI, NFP, GDP, PCE), "
+        "Gold (XAU) safe-haven flows, Oil (WTI/Brent) supply disruptions, "
+        "Major FX pairs (EURUSD, GBPUSD, USDJPY, DXY). "
         "NO trading signals. NO technical-only charts.",
     ),
+
+    # ── Calendar feature ──────────────────────────────────────────────────────
+    # Set to "forex_factory" to enable daily briefings, reminders, weekly outlook.
+    # Leave empty to disable calendar features.
+    "calendar_source": os.getenv("CALENDAR_SOURCE", ""),
 
     # Timing
     "poll_interval_seconds": int(os.getenv("POLL_INTERVAL", "60")),
@@ -97,22 +104,63 @@ CONFIG = {
 # ─── Graceful shutdown ─────────────────────────────────────────────────────────
 _shutdown = asyncio.Event()
 
+
 def _handle_signal(sig, _frame):
-    log.info(f"Signal {sig} received — shutting down …")
+    log.info(f"Signal {sig.name} received — shutting down …")
     _shutdown.set()
+
 
 signal.signal(signal.SIGINT,  _handle_signal)
 signal.signal(signal.SIGTERM, _handle_signal)
 
 
-# ─── Main ──────────────────────────────────────────────────────────────────────
+# ─── Poll loop ─────────────────────────────────────────────────────────────────
+async def poll_loop(scraper: ChannelScraper):
+    log.info("✅  Telegram client connected. Entering poll loop …")
+    interval = CONFIG["poll_interval_seconds"]
+    while not _shutdown.is_set():
+        try:
+            await scraper.poll_and_forward()
+        except Exception as exc:
+            log.error(f"Poll cycle error: {exc}", exc_info=True)
+
+        try:
+            await asyncio.wait_for(_shutdown.wait(), timeout=interval)
+        except asyncio.TimeoutError:
+            pass  # Normal — loop again
+
+
+# ─── Reminder dispatcher loop ──────────────────────────────────────────────────
+async def reminder_loop(scraper: ChannelScraper):
+    """
+    Runs every 60 seconds, independently of the main poll loop.
+    Checks if any ForexFactory event is 10 minutes away and sends alerts.
+    """
+    log.info("🔔  Reminder dispatcher started.")
+    while not _shutdown.is_set():
+        try:
+            await scraper._check_daily_briefing()
+            await scraper._check_reminders()
+            await scraper._check_weekly_outlook()
+        except Exception as exc:
+            log.error(f"Reminder loop error: {exc}", exc_info=True)
+
+        try:
+            await asyncio.wait_for(_shutdown.wait(), timeout=60)
+        except asyncio.TimeoutError:
+            pass
+    log.info("🔔  Reminder dispatcher stopped.")
+
+
+# ─── Main entry point ──────────────────────────────────────────────────────────
 async def run():
     log.info("🚀  AXIOM INTEL — Geopolitical Channel Manager starting …")
     log.info(f"📡  Monitoring {len(CONFIG['source_channels'])} news source(s)")
     log.info(f"📤  Destination: {CONFIG['dest_channel']}")
 
-    if CONFIG["calendar_source"]:
-        log.info(f"📅  Calendar source: {CONFIG['calendar_source']} ✅")
+    cal = CONFIG["calendar_source"]
+    if cal:
+        log.info(f"📅  Calendar source: {cal} (daily briefings + reminders enabled)")
     else:
         log.info("📅  Calendar source: not configured (set CALENDAR_SOURCE to enable)")
 
@@ -121,41 +169,38 @@ async def run():
     else:
         log.info("🔑  Auth mode: File session (ensure .session file exists)")
 
+    # ── Init memory ────────────────────────────────────────────────────────────
     memory = MemoryManager(
         db_path=CONFIG["db_path"],
         ttl_days=CONFIG["hash_ttl_days"],
     )
     await memory.init()
 
+    # ── Init AI engine ─────────────────────────────────────────────────────────
     ai = AIEngine(
         gemini_key=CONFIG["gemini_api_key"],
         groq_key=CONFIG["groq_api_key"],
         channel_category=CONFIG["channel_category"],
     )
 
+    # ── Init scraper ───────────────────────────────────────────────────────────
     scraper = ChannelScraper(
         config=CONFIG,
         ai_engine=ai,
         memory=memory,
     )
-
     await scraper.start()
-    log.info("✅  Telegram client connected. Entering poll loop …")
 
     try:
-        while not _shutdown.is_set():
-            try:
-                await scraper.poll_and_forward()
-            except Exception as exc:
-                log.error(f"Poll cycle error: {exc}", exc_info=True)
-
-            try:
-                await asyncio.wait_for(
-                    _shutdown.wait(),
-                    timeout=CONFIG["poll_interval_seconds"],
-                )
-            except asyncio.TimeoutError:
-                pass  # normal — loop again
+        if CONFIG["calendar_source"]:
+            # Run poll loop + reminder dispatcher concurrently
+            await asyncio.gather(
+                poll_loop(scraper),
+                reminder_loop(scraper),
+            )
+        else:
+            # Calendar disabled — poll loop only
+            await poll_loop(scraper)
     finally:
         log.info("🛑  Shutting down gracefully …")
         await scraper.stop()
