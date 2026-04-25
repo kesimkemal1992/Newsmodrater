@@ -6,6 +6,11 @@ First time setup:
     python generate_session.py   ← run locally, get SESSION_STRING
     Paste SESSION_STRING into Railway environment variables.
     Deploy. Done.
+
+New in this version:
+    CALENDAR_SOURCE  — optional dedicated channel for ForexFactory/Calendar
+                       screenshots. High Impact (Red Folder) events trigger
+                       an automated reminder 10 minutes before release.
 """
 
 import asyncio
@@ -47,23 +52,28 @@ CONFIG = {
     # Telegram credentials
     "api_id":         int(_require("TELEGRAM_API_ID")),
     "api_hash":       _require("TELEGRAM_API_HASH"),
-    "phone":          os.getenv("TELEGRAM_PHONE", ""),   # optional when using string session
+    "phone":          os.getenv("TELEGRAM_PHONE", ""),
 
-    # ✅ String session — no OTP needed on server
-    "session_string": os.getenv("SESSION_STRING", ""),   # preferred
-    "session_name":   os.getenv("SESSION_NAME", "manager_session"),  # fallback (local file)
+    # Session
+    "session_string": os.getenv("SESSION_STRING", ""),
+    "session_name":   os.getenv("SESSION_NAME", "manager_session"),
 
-    # Channels
+    # Channels — regular news sources
     "source_channels": [
         c.strip() for c in _require("SOURCE_CHANNELS").split(",") if c.strip()
     ],
     "dest_channel": _require("DEST_CHANNEL"),
 
+    # NEW: dedicated calendar/ForexFactory channel (optional)
+    # Set CALENDAR_SOURCE to a Telegram channel username or ID.
+    # If not set, calendar scanning is disabled.
+    "calendar_source": os.getenv("CALENDAR_SOURCE", "").strip(),
+
     # AI keys
     "gemini_api_key": _require("GEMINI_API_KEY"),
     "groq_api_key":   _require("GROQ_API_KEY"),
 
-    # Channel focus (injected into every AI prompt)
+    # Channel focus (injected into every news AI prompt)
     "channel_category": os.getenv(
         "CHANNEL_CATEGORY",
         "Geopolitical events (wars, sanctions, elections), Central Bank policy "
@@ -98,8 +108,13 @@ signal.signal(signal.SIGTERM, _handle_signal)
 # ─── Main ──────────────────────────────────────────────────────────────────────
 async def run():
     log.info("🚀  AXIOM INTEL — Geopolitical Channel Manager starting …")
-    log.info(f"📡  Monitoring {len(CONFIG['source_channels'])} source channel(s)")
+    log.info(f"📡  Monitoring {len(CONFIG['source_channels'])} news source(s)")
     log.info(f"📤  Destination: {CONFIG['dest_channel']}")
+
+    if CONFIG["calendar_source"]:
+        log.info(f"📅  Calendar source: {CONFIG['calendar_source']} ✅")
+    else:
+        log.info("📅  Calendar source: not configured (set CALENDAR_SOURCE to enable)")
 
     if CONFIG["session_string"]:
         log.info("🔑  Auth mode: StringSession ✅")
