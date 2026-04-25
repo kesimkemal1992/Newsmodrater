@@ -150,7 +150,7 @@ PREVIOUS: {previous}
 ✅ Move Stop-Loss to Break-even
 ✅ No new entries during release
 
-*PROTECT YOUR CAPITAL. NO GAMBLING.*
+*PROTECT YOUR CAPITAL. 💯.*
 ```
 
 Return ONLY the formatted alert text. No JSON. No explanations.
@@ -510,7 +510,7 @@ class AIEngine:
             f"✅ Secure open profits\n"
             f"✅ Move Stop-Loss to Break-even\n"
             f"✅ No new entries during release\n\n"
-            f"*PROTECT YOUR CAPITAL 💯
+            f"*PROTECT YOUR CAPITAL. NO GAMBLING.*"
         )
 
     @staticmethod
