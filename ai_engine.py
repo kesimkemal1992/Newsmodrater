@@ -5,7 +5,7 @@ Primary  : Gemini 2.5 Flash  (google-generativeai)
 Fallback : Groq llama-4-scout (vision capable)
 
 Style: Senior Institutional Trader — English only, minimalist, direct.
-       No personal opinions. Data-first. 12-hour AM/PM time format.
+       NO asterisks. NO markdown bolding. Data-first. 12-hour AM/PM time format.
 """
 
 import asyncio
@@ -22,22 +22,26 @@ from groq import AsyncGroq
 
 log = logging.getLogger("ai_engine")
 
-# ─── Institutional Moderation Prompt ──────────────────────────────────────────
+# ─── News Moderation System Prompt ────────────────────────────────────────────
 _SYSTEM_PROMPT = """
 You are AXIOM INTEL — a Senior Institutional Macro & Geopolitical news editor
 for a professional Telegram trading channel. Your audience is experienced traders.
 
 YOUR ONLY JOB:
-Take the source content, verify its relevance, and format it in a clean
-institutional style. Do NOT speculate. Do NOT add analysis beyond the facts.
+Take the source content, verify its relevance, and format it cleanly.
+Do NOT speculate. Do NOT add analysis beyond the facts.
 Do NOT change the meaning. Format it professionally and precisely.
 
+CRITICAL FORMATTING RULE:
+DO NOT use asterisks (*) or any markdown bolding anywhere in the output.
+Use ONLY plain text, emojis, and hashtags. No bold. No italic. No markdown.
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🚫  REJECT IF ANY OF THESE APPLY:
+REJECT IF ANY OF THESE APPLY:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 1. SIGNALS       — Buy / Sell / Long / Short / Entry / TP / SL / price targets
 2. CHART ONLY    — Image with no news context
-3. WATERMARK     — Another channel's logo or username on image
+3. WATERMARK     — Another channel logo or username on image
 4. STALE         — Content older than 18 hours
 5. OFF-TOPIC     — Not about geopolitics, central banks, CPI/NFP/GDP,
                    Gold, Oil, major FX pairs, interest rates
@@ -45,23 +49,24 @@ Do NOT change the meaning. Format it professionally and precisely.
 7. DUPLICATE     — Essentially same content already processed
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-✅  FORMAT (if approved):
+FORMAT (if approved):
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-[EMOJI] *[SHORT ENGLISH HEADLINE — one line, factual and direct]*
+[EMOJI] [SHORT ENGLISH HEADLINE — one line, factual and direct]
 
-[Source content lightly cleaned. English only. Bold instrument names and
-key numbers. 2-4 sentences max. Do not add anything new.]
+[Source content lightly cleaned. English only. NO bold. NO asterisks.
+2-4 sentences max. Do not add anything new.]
 
-📌 MARKET STATUS: [ONE short line on likely market impact — e.g.,
-   "Focus: USD liquidity expansion ahead of FOMC." or
+📌 MARKET STATUS: [ONE short line on likely market impact — plain text only,
+   no asterisks, e.g. "Focus: USD liquidity expansion ahead of FOMC." or
    "Gold safe-haven demand elevated on geopolitical risk."]
 
 #PAIR1 #PAIR2
 
 RULES:
 • English ONLY. No Amharic or other languages.
-• *bold* only for: instrument names (*XAUUSD*, *DXY*) and key numbers (*5.25%*)
+• ZERO asterisks anywhere — not for bold, not for any reason
+• Plain text only for all content
 • 12-hour time format: 03:30 PM, 08:00 AM (never 24-hour)
 • Total post: 60-120 words MAX
 • Hashtags only for instruments directly mentioned
@@ -74,117 +79,123 @@ EMOJI — pick ONE that matches:
   💵 USD/FX flows      ⚠️ Risk event
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-RESPOND WITH VALID JSON ONLY — NO MARKDOWN FENCES:
+RESPOND WITH VALID JSON ONLY — NO MARKDOWN FENCES — NO TRAILING COMMAS:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-{
-  "approved": true | false,
-  "reason": "brief reason",
-  "issues": [],
-  "formatted_text": "full post here (empty if rejected)",
-  "hashtags": "#PAIR1 #PAIR2 (empty if rejected)",
-  "confidence": 0.0
-}
+{"approved": true, "reason": "brief reason", "issues": [], "formatted_text": "post here", "hashtags": "#PAIR1", "confidence": 0.9}
 """.strip()
 
-# ─── Forex Factory Daily Briefing Prompt ──────────────────────────────────────
+# ─── Daily Briefing Prompt ─────────────────────────────────────────────────────
 _BRIEFING_PROMPT_TEMPLATE = """
-You are AXIOM INTEL — a Senior Institutional Macro trader.
+You are a Senior Institutional Trader writing a morning economic calendar briefing.
 
-Today's high-impact forex factory events (Red + Orange impact only) are listed below.
-Format them into a professional DAILY NEWS BRIEFING.
-
-EVENTS (JSON):
-{events_json}
-
-OUTPUT FORMAT (Telegram Markdown, strictly follow this):
-```
-📅 *TODAY'S HIGH IMPACT NEWS*
-{date_str}
-
-{for each event sorted by time:}
-🔴 {time_12h} | {currency}: {event_name}
-• Forecast: {forecast} | Previous: {previous}
-
-{if orange impact use 🟠 instead of 🔴}
-```
-
-After listing all events, add ONE line:
-📌 *MARKET STATUS:* [Brief institutional assessment — e.g.,
-"USD under pressure ahead of NFP release. Gold may see volatility."]
-
-RULES:
-- English only. Institutional tone. No opinions.
-- Times in 12-hour AM/PM format (Africa/Addis_Ababa GMT+3).
-- If Forecast or Previous is unknown, write "—"
+STRICT RULES:
+- DO NOT use asterisks (*) or any markdown bolding anywhere
+- Plain text and emojis ONLY
+- English only
+- Times in 12-hour AM/PM format (Africa/Addis_Ababa GMT+3)
+- If Forecast or Previous is unknown, write a dash (—)
 - Sort events chronologically
 - Only include Red (🔴) and Orange (🟠) impact events
-- Do NOT add any signals, advice, or trade recommendations
 
-Return ONLY the formatted message text. No JSON. No explanations.
+Today's high-impact events (JSON):
+{events_json}
+
+Date: {date_str}
+
+Write the briefing in this EXACT format (no asterisks anywhere):
+
+📅 TODAY'S HIGH IMPACT NEWS
+{date_str}
+
+🔴 03:30 PM | USD: Event Name
+• Forecast: 0.3% | Previous: 0.4%
+
+🟠 05:00 PM | EUR: Another Event
+• Forecast: — | Previous: 1.2%
+
+📌 MARKET STATUS: [One plain-text sentence on expected volatility or market theme]
+
+Return ONLY the formatted message. No JSON. No markdown. No asterisks.
 """.strip()
 
 # ─── 10-Minute Alert Prompt ────────────────────────────────────────────────────
 _ALERT_PROMPT_TEMPLATE = """
-You are AXIOM INTEL — Senior Institutional Trader.
+You are a Senior Institutional Trader writing a pre-event warning alert.
 
-Generate a professional 10-MINUTE WARNING alert for this upcoming event:
+STRICT RULES:
+- DO NOT use asterisks (*) or any markdown bolding — plain text only
+- English only
+- No MARKET FOCUS or MARKET STATUS section
+- The motivational closing line is already provided below — use it exactly as given, do not change it
 
-EVENT NAME: {event_name}
-CURRENCY: {currency}
-TIME: {time_12h}
-FORECAST: {forecast}
-PREVIOUS: {previous}
-IMPACT: {impact}
+Event details:
+Name: {event_name}
+Currency: {currency}
+Time: {time_12h} EAT
+Forecast: {forecast}
+Previous: {previous}
+Impact: {impact_emoji}
 
-OUTPUT FORMAT (Telegram Markdown, strictly follow):
-```
-🚨 *ALERT: 10 MINUTES REMAINING*
+Motivational closing line (copy exactly, do not modify):
+{motivational_line}
+
+Write in this EXACT format:
+
+🚨 ALERT: 10 MINUTES REMAINING
 
 EVENT: {impact_emoji} {event_name}
 TIME: {time_12h} EAT
 FORECAST: {forecast}
 PREVIOUS: {previous}
 
-*REQUIRED ACTION:*
-✅ Secure open profits
+REQUIRED ACTION:
+✅ Secure open profits now
 ✅ Move Stop-Loss to Break-even
-✅ No new entries during release
+✅ No new entries during the release
 
-*PROTECT YOUR CAPITAL. 💯.*
-```
+{motivational_line}
 
-Return ONLY the formatted alert text. No JSON. No explanations.
+Return ONLY the formatted alert. No JSON. No markdown. No asterisks.
 """.strip()
 
 # ─── Weekly Outlook Prompt ─────────────────────────────────────────────────────
 _WEEKLY_PROMPT_TEMPLATE = """
-You are AXIOM INTEL — Senior Institutional Trader.
+You are a Senior Institutional Trader writing a Sunday weekly economic outlook.
 
-Generate a professional WEEKLY OUTLOOK briefing for the coming week.
-Events are listed below (Red + Orange only):
+STRICT RULES:
+- DO NOT use asterisks (*) or any markdown bolding — plain text only
+- Use emojis for structure and visual clarity
+- English only
+- Times in 12-hour AM/PM format (Africa/Addis_Ababa GMT+3)
+- If Forecast or Previous is unknown, write a dash (—)
+- Group events by day, sorted chronologically
+- Only Red (🔴) and Orange (🟠) events
 
-EVENTS (JSON):
+Events this week (JSON):
 {events_json}
 
-Week range: {week_range}
+Week: {week_range}
 
-OUTPUT FORMAT (Telegram Markdown):
-```
-📅 *WEEKLY HIGH IMPACT OUTLOOK*
+Write in this EXACT format (no asterisks anywhere):
+
+📅 WEEKLY HIGH IMPACT OUTLOOK
 Week of {week_range}
 
-{Group events by day, sorted chronologically}
-*{DAY NAME} — {Date}*
-🔴 {time_12h} | {currency}: {event_name}
-  ↳ Forecast: {forecast} | Previous: {previous}
+Monday — [Date]
+🔴 [time] | [currency]: [event name]
+  ↳ Forecast: [value] | Previous: [value]
 
-📌 *KEY FOCUS THIS WEEK:*
-[2-3 sentence institutional summary of the most critical events and
-expected market themes — NFP, FOMC, CPI etc. English only. Factual.]
+Tuesday — [Date]
+🟠 [time] | [currency]: [event name]
+  ↳ Forecast: [value] | Previous: [value]
 
-```
+[Continue for all days that have events]
 
-Return ONLY the formatted message. No JSON. No explanations.
+📌 KEY FOCUS THIS WEEK:
+[2-3 plain text sentences. Factual institutional summary.
+No asterisks. Mention the most critical events and market themes.]
+
+Return ONLY the formatted message. No JSON. No markdown. No asterisks.
 """.strip()
 
 
@@ -194,6 +205,37 @@ def _b64(data: bytes) -> str:
 
 def _today_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+
+# ─── Rotating Motivational Closer Pool ────────────────────────────────────────
+# 20 hand-crafted capital-protection lines. Cycles every 20 reminders.
+# Index is tracked in memory.db so it persists across restarts.
+_MOTIVATIONAL_POOL = [
+    "🛡️ Protect your capital first. Big moves are coming — size wisely and stay patient. 💡",
+    "🔒 Risk small. Let the market show its hand before you commit. 🎯",
+    "⚡ High-volatility event. Keep risk tight and your head clear. 🧘",
+    "💎 Surviving volatile sessions is a skill. The best traders sit on their hands. 🤝",
+    "🏦 Institutions are moving. Your job right now is to not be their exit liquidity. 🚫",
+    "🧠 Patience is your edge today. React, don't predict. The setup will be clearer after. ⏳",
+    "🌊 Big waves are forming. Stay close to shore until the direction is confirmed. 🧭",
+    "🔐 Lock in what you have. Another setup will come — your capital must still be here for it. 📅",
+    "⚠️ News events punish overconfidence. Small size, clear head, defined risk. Always. 📐",
+    "💡 The trade you skip is sometimes your best trade. Protect the account. Live to trade tomorrow. 🗓️",
+    "🎯 Focus on capital preservation. A 10% loss needs an 11% gain to recover. Stay sharp. 📊",
+    "🛑 Step back. Let the dust settle. The real opportunity comes after the spike — not during it. 👁️",
+    "🤫 Quiet hands make the most money on news days. Do nothing and let others panic. 🧊",
+    "⚓ Keep your risk anchored. No event result is worth blowing your account over. 🔒",
+    "🦅 The smart money waits for clarity. Be the eagle, not the noise. Stay elevated. 🌤️",
+    "🧱 Build your account brick by brick. One bad news trade can undo weeks of work. 🏗️",
+    "💰 Your account balance is your ammunition. Don't fire it blindly into the fog. 🎖️",
+    "🌡️ Volatility spikes in both directions. If you are not sure — you are not ready. Wait. ⏸️",
+    "📌 Pin this moment. The traders who last are the ones who protected capital when it mattered. 🏆",
+    "🔑 Discipline is the unlock. Every time you protect your account, you earn the right to the next trade. 🚀",
+]
+
+def _get_motivational_line(index: int = 0) -> str:
+    """Pick a motivational line by cycling index through the pool."""
+    return _MOTIVATIONAL_POOL[index % len(_MOTIVATIONAL_POOL)]
 
 
 _SIGNAL_RE = re.compile(
@@ -211,22 +253,59 @@ def _signal_hit(text: str) -> Optional[str]:
 
 
 def _parse_json(raw: str) -> dict:
-    raw = re.sub(r"```(?:json)?", "", raw).strip().strip("`").strip()
+    """
+    Extremely robust JSON parser.
+    Handles: markdown fences, trailing commas, extra whitespace,
+    partial JSON, and any other malformed output from Gemini/Groq.
+    Never crashes the pipeline.
+    """
+    if not raw:
+        raise ValueError("Empty response from AI engine.")
+
+    # Step 1: Strip all markdown code fences aggressively
+    raw = re.sub(r"```+(?:json|JSON)?", "", raw)
+    raw = re.sub(r"```+", "", raw)
+    raw = raw.strip().strip("`").strip()
+
+    # Step 2: Remove trailing commas before } or ] (common Gemini issue)
+    raw = re.sub(r",\s*([}\]])", r"\1", raw)
+
+    # Step 3: Try direct JSON parse first
     try:
         data = json.loads(raw)
+        return _validate_and_clean(data, raw)
     except json.JSONDecodeError:
-        m = re.search(r"\{.*\}", raw, re.DOTALL)
-        if m:
-            data = json.loads(m.group())
-        else:
-            raise ValueError(f"No JSON found:\n{raw[:300]}")
+        pass
 
+    # Step 4: Extract first {...} block from the string
+    m = re.search(r"\{.*\}", raw, re.DOTALL)
+    if m:
+        candidate = m.group()
+        # Clean trailing commas again inside extracted block
+        candidate = re.sub(r",\s*([}\]])", r"\1", candidate)
+        try:
+            data = json.loads(candidate)
+            return _validate_and_clean(data, raw)
+        except json.JSONDecodeError:
+            pass
+
+    # Step 5: Last resort — try to reconstruct from key patterns
+    log.warning(f"_parse_json: all strategies failed. Raw snippet: {raw[:200]}")
+    raise ValueError(f"No valid JSON found in AI response:\n{raw[:300]}")
+
+
+def _validate_and_clean(data: dict, raw: str) -> dict:
+    """Set defaults, strip stray asterisks from output, run signal check."""
     data.setdefault("approved", False)
     data.setdefault("reason", "")
     data.setdefault("issues", [])
     data.setdefault("formatted_text", "")
     data.setdefault("hashtags", "")
     data.setdefault("confidence", 0.5)
+
+    # Strip any stray asterisks the AI snuck in despite instructions
+    if data.get("formatted_text"):
+        data["formatted_text"] = data["formatted_text"].replace("*", "")
 
     # Safety: reject if signal snuck into output
     if data.get("approved") and _signal_hit(data.get("formatted_text", "")):
@@ -240,6 +319,11 @@ def _parse_json(raw: str) -> dict:
     return data
 
 
+def _strip_asterisks(text: str) -> str:
+    """Post-process any AI text output to remove stray asterisks."""
+    return text.replace("*", "") if text else text
+
+
 class AIEngine:
     def __init__(self, gemini_key: str, groq_key: str, channel_category: str):
         self._category = channel_category
@@ -247,7 +331,7 @@ class AIEngine:
 
         genai.configure(api_key=gemini_key)
 
-        # ✅ Fixed: use the correct stable model name
+        # Primary: Gemini 2.5 Flash — JSON mode for moderation
         self._gemini = genai.GenerativeModel(
             model_name="gemini-2.5-flash",
             system_instruction=_SYSTEM_PROMPT,
@@ -258,7 +342,7 @@ class AIEngine:
             ),
         )
 
-        # Gemini model without forced JSON mode — for free-text generation
+        # Gemini text model — for free-text generation (briefings, alerts, weekly)
         self._gemini_text = genai.GenerativeModel(
             model_name="gemini-2.5-flash",
             generation_config=genai.GenerationConfig(
@@ -267,7 +351,7 @@ class AIEngine:
             ),
         )
 
-    # ── News Moderation (existing flow) ───────────────────────────────────────
+    # ── News Moderation ────────────────────────────────────────────────────────
     async def analyse(
         self,
         text: str,
@@ -276,7 +360,6 @@ class AIEngine:
     ) -> dict:
         """Analyse a scraped Telegram message for approval/rejection."""
 
-        # Pre-filter signals before paying for API call
         hit = _signal_hit(text)
         if hit:
             log.info(f"[PRE-FILTER] Signal keyword '{hit}' — instant reject.")
@@ -327,7 +410,7 @@ class AIEngine:
                 "engine": "none",
             }
 
-    # ── Daily Briefing Generation ──────────────────────────────────────────────
+    # ── Daily Briefing ─────────────────────────────────────────────────────────
     async def generate_daily_briefing(self, events: list, date_str: str) -> str:
         """Generate today's high-impact forex news briefing from events list."""
         if not events:
@@ -343,7 +426,7 @@ class AIEngine:
                 self._gemini_text_call(prompt), timeout=45
             )
             log.info("Daily briefing generated via Gemini.")
-            return result.strip()
+            return _strip_asterisks(result.strip())
         except Exception as exc:
             log.warning(f"Gemini briefing failed ({exc}) — trying Groq …")
 
@@ -352,15 +435,20 @@ class AIEngine:
                 self._groq_text_call(prompt), timeout=60
             )
             log.info("Daily briefing generated via Groq fallback.")
-            return result.strip()
+            return _strip_asterisks(result.strip())
         except Exception as exc:
-            log.error(f"Groq briefing failed ({exc}) — using fallback format.")
+            log.error(f"Both engines failed for briefing — using fallback formatter.")
             return self._fallback_briefing(events, date_str)
 
-    # ── 10-Minute Alert Generation ─────────────────────────────────────────────
-    async def generate_alert(self, event: dict) -> str:
-        """Generate a 10-minute pre-event warning alert."""
+    # ── 10-Minute Alert ────────────────────────────────────────────────────────
+    async def generate_alert(self, event: dict, motivational_index: int = 0) -> str:
+        """
+        Generate a 10-minute pre-event warning alert.
+        motivational_index cycles through _MOTIVATIONAL_POOL so each reminder
+        shows a different line. Tracks across restarts via memory DB index.
+        """
         impact_emoji = "🔴" if event.get("impact") == "red" else "🟠"
+        motivational_line = _get_motivational_line(motivational_index)
         prompt = _ALERT_PROMPT_TEMPLATE.format(
             event_name=event.get("name", "Unknown Event"),
             currency=event.get("currency", "USD"),
@@ -369,6 +457,7 @@ class AIEngine:
             previous=event.get("previous", "—"),
             impact=event.get("impact", "red"),
             impact_emoji=impact_emoji,
+            motivational_line=motivational_line,
         )
 
         try:
@@ -376,20 +465,20 @@ class AIEngine:
                 self._gemini_text_call(prompt), timeout=30
             )
             log.info(f"Alert generated for: {event.get('name')}")
-            return result.strip()
+            return _strip_asterisks(result.strip())
         except Exception as exc:
-            log.warning(f"Gemini alert failed ({exc}) — using fallback.")
+            log.warning(f"Gemini alert failed ({exc}) — trying Groq …")
 
         try:
             result = await asyncio.wait_for(
                 self._groq_text_call(prompt), timeout=45
             )
-            return result.strip()
+            return _strip_asterisks(result.strip())
         except Exception as exc:
-            log.error(f"Groq alert failed ({exc}) — using fallback format.")
+            log.error(f"Both engines failed for alert — using fallback.")
             return self._fallback_alert(event)
 
-    # ── Weekly Outlook Generation ──────────────────────────────────────────────
+    # ── Weekly Outlook ─────────────────────────────────────────────────────────
     async def generate_weekly_outlook(self, events: list, week_range: str) -> str:
         """Generate Sunday weekly outlook from scraped events."""
         if not events:
@@ -405,7 +494,7 @@ class AIEngine:
                 self._gemini_text_call(prompt), timeout=60
             )
             log.info("Weekly outlook generated via Gemini.")
-            return result.strip()
+            return _strip_asterisks(result.strip())
         except Exception as exc:
             log.warning(f"Gemini weekly failed ({exc}) — trying Groq …")
 
@@ -414,9 +503,9 @@ class AIEngine:
                 self._groq_text_call(prompt), timeout=75
             )
             log.info("Weekly outlook generated via Groq fallback.")
-            return result.strip()
+            return _strip_asterisks(result.strip())
         except Exception as exc:
-            log.error(f"Weekly outlook generation failed: {exc}")
+            log.error(f"Weekly outlook generation completely failed: {exc}")
             return self._fallback_weekly(events, week_range)
 
     # ── Internal API Callers ───────────────────────────────────────────────────
@@ -435,7 +524,8 @@ class AIEngine:
             2. If image present: scan for watermarks or signals, check timestamps.
             3. If approved: lightly clean and format. English only. 60-120 words max.
                Add a MARKET STATUS line. Use 12-hour AM/PM times.
-            4. Return valid JSON only — no markdown fences.
+               DO NOT use asterisks or markdown bolding.
+            4. Return valid JSON only — no markdown fences — no trailing commas.
         """).strip()
 
     async def _gemini_call(self, prompt: str, image_data: Optional[bytes], image_mime: str) -> dict:
@@ -482,10 +572,10 @@ class AIEngine:
         )
         return resp.choices[0].message.content
 
-    # ── Fallback Formatters (no AI) ────────────────────────────────────────────
+    # ── Fallback Formatters (no AI — zero asterisks) ───────────────────────────
     @staticmethod
     def _fallback_briefing(events: list, date_str: str) -> str:
-        lines = [f"📅 *TODAY'S HIGH IMPACT NEWS*\n{date_str}\n"]
+        lines = [f"📅 TODAY'S HIGH IMPACT NEWS\n{date_str}\n"]
         for ev in events:
             emoji = "🔴" if ev.get("impact") == "red" else "🟠"
             lines.append(
@@ -494,31 +584,32 @@ class AIEngine:
                 f"• Forecast: {ev.get('forecast', '—')} | "
                 f"Previous: {ev.get('previous', '—')}"
             )
-        lines.append("\n📌 *MARKET STATUS:* Monitor volatility closely during releases.")
+        lines.append("\n📌 MARKET STATUS: Monitor volatility closely during all releases.")
         return "\n".join(lines)
 
     @staticmethod
-    def _fallback_alert(event: dict) -> str:
+    def _fallback_alert(event: dict, motivational_index: int = 0) -> str:
         emoji = "🔴" if event.get("impact") == "red" else "🟠"
+        line = _get_motivational_line(motivational_index)
         return (
-            f"🚨 *ALERT: 10 MINUTES REMAINING*\n\n"
+            f"🚨 ALERT: 10 MINUTES REMAINING\n\n"
             f"EVENT: {emoji} {event.get('name', 'Unknown Event')}\n"
             f"TIME: {event.get('time_12h', '—')} EAT\n"
             f"FORECAST: {event.get('forecast', '—')}\n"
             f"PREVIOUS: {event.get('previous', '—')}\n\n"
-            f"*REQUIRED ACTION:*\n"
-            f"✅ Secure open profits\n"
+            f"REQUIRED ACTION:\n"
+            f"✅ Secure open profits now\n"
             f"✅ Move Stop-Loss to Break-even\n"
-            f"✅ No new entries during release\n\n"
-            f"*PROTECT YOUR CAPITAL. NO GAMBLING.*"
+            f"✅ No new entries during the release\n\n"
+            f"{line}"
         )
 
     @staticmethod
     def _fallback_weekly(events: list, week_range: str) -> str:
-        lines = [f"📅 *WEEKLY HIGH IMPACT OUTLOOK*\nWeek of {week_range}\n"]
         from itertools import groupby
+        lines = [f"📅 WEEKLY HIGH IMPACT OUTLOOK\nWeek of {week_range}\n"]
         for day, day_events in groupby(events, key=lambda e: e.get("date", "Unknown")):
-            lines.append(f"\n*{day}*")
+            lines.append(f"\n{day}")
             for ev in day_events:
                 emoji = "🔴" if ev.get("impact") == "red" else "🟠"
                 lines.append(
@@ -527,5 +618,9 @@ class AIEngine:
                     f"  ↳ Forecast: {ev.get('forecast', '—')} | "
                     f"Previous: {ev.get('previous', '—')}"
                 )
-
+        lines.append(
+            "\n📌 KEY FOCUS THIS WEEK:\n"
+            "Monitor all Red folder events closely. "
+            "Manage risk carefully around high-impact releases."
+        )
         return "\n".join(lines)
