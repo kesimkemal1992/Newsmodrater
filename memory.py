@@ -3,8 +3,9 @@ memory.py — Persistent memory & anti-duplication engine.
 
 Stores:
   • SHA-256 hashes of every processed message (text + image)
-  • Posted message metadata for self-learning analytics
-  • Channel category embeddings (future: semantic dedup)
+  • Posted message metadata for analytics
+  • Channel category last-seen message IDs
+  • Scheduled reminders (calendar events) with sent status
 """
 
 import asyncio
@@ -46,8 +47,21 @@ CREATE TABLE IF NOT EXISTS channel_stats (
     last_seen   REAL
 );
 
-CREATE INDEX IF NOT EXISTS idx_hashes_expires ON content_hashes(expires_at);
-CREATE INDEX IF NOT EXISTS idx_posted_source  ON posted_messages(source_channel, source_msg_id);
+-- NEW: tracks scheduled reminders for High Impact calendar events
+CREATE TABLE IF NOT EXISTS reminders (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_key       TEXT UNIQUE NOT NULL,   -- "<event_name>|<news_time_utc>" normalised
+    event_name      TEXT NOT NULL,
+    news_time_utc   TEXT NOT NULL,          -- "HH:MM UTC"
+    dest_msg_id     INTEGER NOT NULL,       -- the calendar post to reply to
+    reminder_sent   INTEGER DEFAULT 0,      -- 0 = pending, 1 = sent, 2 = skipped
+    created_at      REAL NOT NULL,
+    sent_at         REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_hashes_expires    ON content_hashes(expires_at);
+CREATE INDEX IF NOT EXISTS idx_posted_source     ON posted_messages(source_channel, source_msg_id);
+CREATE INDEX IF NOT EXISTS idx_reminders_pending ON reminders(reminder_sent, news_time_utc);
 """
 
 
@@ -74,24 +88,28 @@ class MemoryManager:
     # ── Hashing helpers ────────────────────────────────────────────────────────
     @staticmethod
     def hash_text(text: str) -> str:
-        """Normalise + hash text content."""
         normalised = " ".join(text.lower().split())
         return hashlib.sha256(normalised.encode()).hexdigest()
 
     @staticmethod
     def hash_bytes(data: bytes) -> str:
-        """Hash raw bytes (image binary)."""
         return hashlib.sha256(data).hexdigest()
 
     @staticmethod
     def hash_combined(text: str, image_data: Optional[bytes]) -> str:
-        """Hash text + optional image together."""
         h = hashlib.sha256()
         if text:
             h.update(" ".join(text.lower().split()).encode())
         if image_data:
             h.update(image_data)
         return h.hexdigest()
+
+    @staticmethod
+    def make_event_key(event_name: str, news_time_utc: str) -> str:
+        """Normalised dedup key for a reminder."""
+        name = " ".join(event_name.lower().strip().split())
+        time_ = news_time_utc.lower().replace(" utc", "").strip()
+        return f"{name}|{time_}"
 
     # ── Deduplication ──────────────────────────────────────────────────────────
     async def is_duplicate(self, content_hash: str) -> bool:
@@ -144,7 +162,7 @@ class MemoryManager:
             )
             await self._db.commit()
 
-    # ── Channel state (last-seen message IDs) ──────────────────────────────────
+    # ── Channel state ──────────────────────────────────────────────────────────
     async def get_last_msg_id(self, channel: str) -> int:
         async with self._db.execute(
             "SELECT last_msg_id FROM channel_stats WHERE channel=?", (channel,)
@@ -164,18 +182,82 @@ class MemoryManager:
             )
             await self._db.commit()
 
+    # ── Reminder management ────────────────────────────────────────────────────
+
+    async def reminder_exists(self, event_key: str) -> bool:
+        """True if this event already has a reminder scheduled or sent."""
+        async with self._db.execute(
+            "SELECT 1 FROM reminders WHERE event_key=?", (event_key,)
+        ) as cur:
+            row = await cur.fetchone()
+        return row is not None
+
+    async def schedule_reminder(
+        self,
+        event_name: str,
+        news_time_utc: str,
+        dest_msg_id: int,
+    ) -> bool:
+        """
+        Insert a pending reminder. Returns True if inserted, False if duplicate.
+        """
+        key = self.make_event_key(event_name, news_time_utc)
+        if await self.reminder_exists(key):
+            log.info(f"[REMINDER] Already exists for key='{key}' — skipping.")
+            return False
+
+        async with self._lock:
+            try:
+                await self._db.execute(
+                    """INSERT INTO reminders
+                       (event_key, event_name, news_time_utc, dest_msg_id,
+                        reminder_sent, created_at)
+                       VALUES (?, ?, ?, ?, 0, ?)""",
+                    (key, event_name, news_time_utc, dest_msg_id, time.time()),
+                )
+                await self._db.commit()
+                log.info(
+                    f"[REMINDER] Scheduled → event='{event_name}' "
+                    f"time='{news_time_utc}' reply_to={dest_msg_id}"
+                )
+                return True
+            except Exception as exc:
+                log.error(f"[REMINDER] Insert failed: {exc}")
+                return False
+
+    async def get_pending_reminders(self) -> list[dict]:
+        """Return all reminders not yet sent or skipped."""
+        async with self._db.execute(
+            """SELECT id, event_key, event_name, news_time_utc, dest_msg_id
+               FROM reminders
+               WHERE reminder_sent = 0
+               ORDER BY news_time_utc ASC""",
+        ) as cur:
+            rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+    async def mark_reminder_sent(self, reminder_id: int, status: int = 1):
+        """status: 1=sent, 2=skipped (too late / past)."""
+        async with self._lock:
+            await self._db.execute(
+                "UPDATE reminders SET reminder_sent=?, sent_at=? WHERE id=?",
+                (status, time.time(), reminder_id),
+            )
+            await self._db.commit()
+
     # ── Eviction ───────────────────────────────────────────────────────────────
     async def _evict_expired(self):
         now = time.time()
         async with self._lock:
-            cur = await self._db.execute(
+            result = await self._db.execute(
                 "DELETE FROM content_hashes WHERE expires_at<=?", (now,)
             )
+            count = result.rowcount
             await self._db.commit()
-        if cur.rowcount:
-            log.info(f"Evicted {cur.rowcount} expired content hashes.")
+        if count:
+            log.info(f"Evicted {count} expired content hashes.")
 
-    # ── Stats (for self-learning / monitoring) ─────────────────────────────────
+    # ── Stats ──────────────────────────────────────────────────────────────────
     async def stats(self) -> dict:
         async with self._db.execute(
             "SELECT COUNT(*) AS n FROM content_hashes"
@@ -186,13 +268,17 @@ class MemoryManager:
         ) as cur:
             posted = (await cur.fetchone())["n"]
         async with self._db.execute(
-            """SELECT COUNT(*) AS n FROM posted_messages
-               WHERE posted_at > ?""",
+            "SELECT COUNT(*) AS n FROM posted_messages WHERE posted_at > ?",
             (time.time() - 86_400,),
         ) as cur:
             posted_24h = (await cur.fetchone())["n"]
+        async with self._db.execute(
+            "SELECT COUNT(*) AS n FROM reminders WHERE reminder_sent = 0"
+        ) as cur:
+            pending_reminders = (await cur.fetchone())["n"]
         return {
-            "tracked_hashes": hashes,
-            "total_posted": posted,
-            "posted_last_24h": posted_24h,
+            "tracked_hashes":    hashes,
+            "total_posted":      posted,
+            "posted_last_24h":   posted_24h,
+            "pending_reminders": pending_reminders,
         }
