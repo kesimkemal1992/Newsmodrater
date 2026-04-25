@@ -1,9 +1,11 @@
 """
-main.py — Telegram Geopolitical & Macro Intelligence Manager
-Entry point: starts the scraper loop and handles graceful shutdown.
+main.py — AXIOM INTEL Telegram Manager
+Uses StringSession so no interactive OTP is needed on Railway/Render.
 
-First-time setup: run `python login.py` to generate your session file
-before deploying to Railway or Render.
+First time setup:
+    python generate_session.py   ← run locally, get SESSION_STRING
+    Paste SESSION_STRING into Railway environment variables.
+    Deploy. Done.
 """
 
 import asyncio
@@ -14,11 +16,11 @@ import sys
 
 from dotenv import load_dotenv
 
+load_dotenv()
+
 from scraper import ChannelScraper
 from ai_engine import AIEngine
 from memory import MemoryManager
-
-load_dotenv()
 
 # ─── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -34,19 +36,22 @@ log = logging.getLogger("main")
 
 # ─── Config ────────────────────────────────────────────────────────────────────
 def _require(key: str) -> str:
-    val = os.environ.get(key)
+    val = os.environ.get(key, "").strip()
     if not val:
-        log.error(f"Missing required environment variable: {key}")
+        log.error(f"❌  Missing required env var: {key}")
         sys.exit(1)
     return val
 
 
 CONFIG = {
-    # Telegram user account (from my.telegram.org)
-    "api_id":       int(_require("TELEGRAM_API_ID")),
-    "api_hash":     _require("TELEGRAM_API_HASH"),
-    "phone":        _require("TELEGRAM_PHONE"),
-    "session_name": os.getenv("SESSION_NAME", "manager_session"),
+    # Telegram credentials
+    "api_id":         int(_require("TELEGRAM_API_ID")),
+    "api_hash":       _require("TELEGRAM_API_HASH"),
+    "phone":          os.getenv("TELEGRAM_PHONE", ""),   # optional when using string session
+
+    # ✅ String session — no OTP needed on server
+    "session_string": os.getenv("SESSION_STRING", ""),   # preferred
+    "session_name":   os.getenv("SESSION_NAME", "manager_session"),  # fallback (local file)
 
     # Channels
     "source_channels": [
@@ -54,17 +59,17 @@ CONFIG = {
     ],
     "dest_channel": _require("DEST_CHANNEL"),
 
-    # AI
+    # AI keys
     "gemini_api_key": _require("GEMINI_API_KEY"),
     "groq_api_key":   _require("GROQ_API_KEY"),
 
-    # Channel niche — now geopolitical & macro focused
+    # Channel focus (injected into every AI prompt)
     "channel_category": os.getenv(
         "CHANNEL_CATEGORY",
         "Geopolitical events (wars, sanctions, elections), Central Bank policy "
         "(FED, ECB, BOE, BOJ), Macroeconomic data (CPI, NFP, GDP), "
-        "Gold (XAU) safe-haven demand, Oil (WTI/Brent) supply disruptions. "
-        "NO trading signals. NO technical-only analysis.",
+        "Gold (XAU) safe-haven flows, Oil (WTI/Brent) supply disruptions. "
+        "NO trading signals. NO technical-only charts.",
     ),
 
     # Timing
@@ -73,29 +78,33 @@ CONFIG = {
     "max_delay_seconds":     float(os.getenv("MAX_DELAY", "30")),
     "lookback_hours":        int(os.getenv("LOOKBACK_HOURS", "2")),
 
-    # Memory
+    # Memory / dedup
     "db_path":       os.getenv("DB_PATH", "memory.db"),
     "hash_ttl_days": int(os.getenv("HASH_TTL_DAYS", "30")),
 }
 
+
 # ─── Graceful shutdown ─────────────────────────────────────────────────────────
 _shutdown = asyncio.Event()
-
 
 def _handle_signal(sig, _frame):
     log.info(f"Signal {sig} received — shutting down …")
     _shutdown.set()
 
-
 signal.signal(signal.SIGINT,  _handle_signal)
 signal.signal(signal.SIGTERM, _handle_signal)
 
 
-# ─── Main loop ─────────────────────────────────────────────────────────────────
+# ─── Main ──────────────────────────────────────────────────────────────────────
 async def run():
     log.info("🚀  AXIOM INTEL — Geopolitical Channel Manager starting …")
     log.info(f"📡  Monitoring {len(CONFIG['source_channels'])} source channel(s)")
     log.info(f"📤  Destination: {CONFIG['dest_channel']}")
+
+    if CONFIG["session_string"]:
+        log.info("🔑  Auth mode: StringSession ✅")
+    else:
+        log.info("🔑  Auth mode: File session (ensure .session file exists)")
 
     memory = MemoryManager(
         db_path=CONFIG["db_path"],
@@ -125,7 +134,6 @@ async def run():
             except Exception as exc:
                 log.error(f"Poll cycle error: {exc}", exc_info=True)
 
-            # Wait for next poll interval (or shutdown signal)
             try:
                 await asyncio.wait_for(
                     _shutdown.wait(),
@@ -133,7 +141,6 @@ async def run():
                 )
             except asyncio.TimeoutError:
                 pass  # normal — loop again
-
     finally:
         log.info("🛑  Shutting down gracefully …")
         await scraper.stop()
