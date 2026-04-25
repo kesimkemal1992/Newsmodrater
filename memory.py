@@ -69,6 +69,14 @@ CREATE TABLE IF NOT EXISTS sent_reminders (
     sent_at         REAL NOT NULL
 );
 
+-- Tracks the global motivational line index (cycles through the pool)
+CREATE TABLE IF NOT EXISTS motivational_state (
+    id          INTEGER PRIMARY KEY CHECK (id = 1),
+    line_index  INTEGER DEFAULT 0,
+    updated_at  REAL
+);
+INSERT OR IGNORE INTO motivational_state (id, line_index, updated_at) VALUES (1, 0, 0);
+
 CREATE INDEX IF NOT EXISTS idx_hashes_expires ON content_hashes(expires_at);
 CREATE INDEX IF NOT EXISTS idx_posted_source  ON posted_messages(source_channel, source_msg_id);
 """
@@ -247,6 +255,26 @@ class MemoryManager:
                 (event_key, time.time()),
             )
             await self._db.commit()
+
+    # ── Motivational Index ─────────────────────────────────────────────────────
+    async def get_and_increment_motivational_index(self) -> int:
+        """
+        Return current motivational line index, then increment it.
+        Cycles through pool of 20 lines. Persists across restarts.
+        """
+        async with self._lock:
+            async with self._db.execute(
+                "SELECT line_index FROM motivational_state WHERE id=1"
+            ) as cur:
+                row = await cur.fetchone()
+            current = row["line_index"] if row else 0
+            next_index = (current + 1) % 20  # pool size = 20
+            await self._db.execute(
+                "UPDATE motivational_state SET line_index=?, updated_at=? WHERE id=1",
+                (next_index, __import__("time").time()),
+            )
+            await self._db.commit()
+        return current
 
     # ── Eviction ───────────────────────────────────────────────────────────────
     async def _evict_expired(self):
