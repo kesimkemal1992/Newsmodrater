@@ -1,13 +1,12 @@
 """
 scraper.py — Telethon channel scraper, forwarder, and Forex Factory scheduler.
 
-Fixes applied:
-  • Cloudflare/bot-detection bypass: realistic browser headers + wait strategy
-  • Currency tracking across rows (FF reuses cells — must carry last seen value)
-  • JS screenshot filter uses data-attribute not innerText for currency
-  • PIL import guard — phash dedup only runs if Pillow is installed
-  • Full debug logging for scrape + screenshot pipeline
-  • Screenshot falls back to full-page if table element not found
+TEST MODE:
+  Set environment variable TEST_MODE=true on Railway to bypass all time checks.
+  The bot will immediately scrape FF, post daily briefing, and run reminders
+  as if it were 7 AM on a Monday — useful for verifying deployment works.
+
+  Set TEST_MODE=false (or remove it) to return to normal scheduled behaviour.
 
 Timezone: Africa/Addis_Ababa (GMT+3) — EAT.
 """
@@ -17,6 +16,7 @@ import io
 import json
 import logging
 import mimetypes
+import os
 import random
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Tuple
@@ -35,17 +35,24 @@ log = logging.getLogger("scraper")
 EAT = pytz.timezone("Africa/Addis_Ababa")
 _IMG_MIMES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
 
-# Check PIL availability once at import time
+# ── TEST MODE ──────────────────────────────────────────────────────────────────
+# Set TEST_MODE=true in Railway environment variables to bypass time checks.
+# Briefing + reminders fire immediately on every poll cycle when enabled.
+TEST_MODE: bool = os.environ.get("TEST_MODE", "false").strip().lower() == "true"
+
+if TEST_MODE:
+    log.warning("⚠️  TEST_MODE=true — all time/date guards bypassed. Disable after testing!")
+
+# ── PIL availability ───────────────────────────────────────────────────────────
 try:
     from PIL import Image as _PIL_Image
     _PIL_AVAILABLE = True
-    log.info("PIL available — perceptual hash dedup enabled.")
 except ImportError:
     _PIL_AVAILABLE = False
     log.warning("PIL not installed — perceptual hash dedup disabled. Run: pip install Pillow")
 
-# ── Reminder rules ─────────────────────────────────────────────────────────────
-_BONUS_HOUR = 18  # 06:00 PM EAT — top-tier events after this get bonus slot
+# ── Reminder config ────────────────────────────────────────────────────────────
+_BONUS_HOUR = 18  # 06:00 PM EAT
 
 _ALWAYS_BONUS_KEYWORDS = (
     "nfp", "non-farm payroll", "non-farm payrolls",
@@ -78,14 +85,12 @@ _FOMC_KEYWORDS = (
 
 _GOLD_KEYWORDS = ("gold", "xau")
 
-# ── Realistic browser user-agent ───────────────────────────────────────────────
 _USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.6367.155 Safari/537.36"
 )
 
-# ── Playwright launch args ─────────────────────────────────────────────────────
 _LAUNCH_ARGS = [
     "--no-sandbox",
     "--disable-setuid-sandbox",
@@ -95,30 +100,21 @@ _LAUNCH_ARGS = [
     "--window-size=1280,900",
 ]
 
-# ── JS: filter table to show USD Red rows only ─────────────────────────────────
-# Uses data carried per-row. FF sometimes reuses currency cells across rows,
-# so we track lastCurrency across siblings to handle inherited values.
 _JS_FILTER_USD_RED = """
 (function() {
     let lastCurrency = '';
     document.querySelectorAll('.calendar__row--event').forEach(row => {
-        // Currency cell — may be empty if inherited from above row
         const curEl = row.querySelector('.calendar__cell.calendar__currency');
         if (curEl) {
             const cur = curEl.innerText.trim();
             if (cur) lastCurrency = cur;
         }
-
         const impEl = row.querySelector('.calendar__impact span');
         const impact = impEl ? impEl.className : '';
-
-        // Hide if not USD or not Red (high impact)
         if (lastCurrency !== 'USD' || !impact.includes('high')) {
             row.style.display = 'none';
         }
     });
-
-    // Hide day-breaker headers whose section has no visible events
     document.querySelectorAll('.calendar__row--day-breaker').forEach(breaker => {
         let next = breaker.nextElementSibling;
         let hasVisible = false;
@@ -132,27 +128,23 @@ _JS_FILTER_USD_RED = """
 """
 
 
-# ── Helper functions ───────────────────────────────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _is_fomc_event(name: str) -> bool:
     n = name.lower()
     return any(kw in n for kw in _FOMC_KEYWORDS)
 
-
 def _is_always_bonus(name: str) -> bool:
     n = name.lower()
     return any(kw in n for kw in _ALWAYS_BONUS_KEYWORDS)
-
 
 def _is_top_tier(name: str) -> bool:
     n = name.lower()
     return any(kw in n for kw in _TOP_TIER_KEYWORDS)
 
-
 def _is_priority_event(name: str) -> bool:
     n = name.lower()
     return any(kw in n for kw in _PRIORITY_KEYWORDS)
-
 
 def _event_hour_eat(event: dict) -> int:
     t = event.get("time_24h", "")
@@ -163,7 +155,6 @@ def _event_hour_eat(event: dict) -> int:
     except (ValueError, IndexError):
         return 0
 
-
 def _qualifies_for_bonus(event: dict) -> bool:
     name = event.get("name", "")
     if _is_always_bonus(name):
@@ -171,7 +162,6 @@ def _qualifies_for_bonus(event: dict) -> bool:
     if _is_top_tier(name) and _event_hour_eat(event) >= _BONUS_HOUR:
         return True
     return False
-
 
 def _is_reminder_eligible(event: dict) -> bool:
     currency = event.get("currency", "").upper().strip()
@@ -188,7 +178,6 @@ def _is_reminder_eligible(event: dict) -> bool:
     previous = event.get("previous", "").strip()
     return bool(forecast and forecast != "—") and bool(previous and previous != "—")
 
-
 def _is_image(msg) -> bool:
     if isinstance(msg.media, MessageMediaPhoto):
         return True
@@ -198,22 +187,16 @@ def _is_image(msg) -> bool:
             return True
     return False
 
-
 def _doc_mime(msg) -> str:
     if isinstance(msg.media, MessageMediaDocument):
         return msg.media.document.mime_type or "image/jpeg"
     return "image/jpeg"
 
-
 def _eat_now() -> datetime:
     return datetime.now(EAT)
 
-
 def _eat_today_str() -> str:
     return _eat_now().strftime("%Y-%m-%d")
-
-
-# ── Perceptual hash — only if PIL available ────────────────────────────────────
 
 def _phash_image(image_bytes: bytes, hash_size: int = 8) -> Optional[str]:
     if not _PIL_AVAILABLE:
@@ -229,16 +212,13 @@ def _phash_image(image_bytes: bytes, hash_size: int = 8) -> Optional[str]:
         log.debug(f"phash failed: {exc}")
         return None
 
-
 def _phash_distance(h1: str, h2: str) -> int:
     try:
         return bin(int(h1, 16) ^ int(h2, 16)).count("1")
     except Exception:
         return 999
 
-
 def _is_forex_factory_image(image_bytes: bytes) -> bool:
-    """Only run if PIL available — otherwise skip phash check entirely."""
     if not _PIL_AVAILABLE:
         return False
     try:
@@ -250,15 +230,8 @@ def _is_forex_factory_image(image_bytes: bytes) -> bool:
     except Exception:
         return False
 
-
-# ── Playwright helpers ─────────────────────────────────────────────────────────
-
 def _make_browser_context(playwright, viewport_height: int = 1000):
-    """Launch Chromium with anti-detection settings."""
-    browser = playwright.chromium.launch(
-        headless=True,
-        args=_LAUNCH_ARGS,
-    )
+    browser = playwright.chromium.launch(headless=True, args=_LAUNCH_ARGS)
     context = browser.new_context(
         locale="en-US",
         timezone_id="Africa/Addis_Ababa",
@@ -269,59 +242,39 @@ def _make_browser_context(playwright, viewport_height: int = 1000):
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         },
     )
-    # Hide navigator.webdriver flag
     context.add_init_script("""
         Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-        Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
+        Object.defineProperty(navigator, 'plugins',   { get: () => [1, 2, 3] });
         Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
     """)
     return browser, context
 
-
-def _wait_for_calendar(page, url: str, timeout: int = 45_000):
-    """
-    Navigate to FF and wait for the calendar table.
-    Tries multiple selectors in case FF updates their markup.
-    Logs page title and URL for debugging.
-    """
+def _wait_for_calendar(page, url: str, timeout: int = 45_000) -> bool:
     log.debug(f"Navigating to: {url}")
     page.goto(url, timeout=timeout, wait_until="domcontentloaded")
-
-    # Small human-like delay
     page.wait_for_timeout(2000)
-
-    # Try primary selector
     try:
         page.wait_for_selector(".calendar__table", timeout=20_000)
-        log.debug("Calendar table found via .calendar__table")
+        log.debug("Calendar table found.")
         return True
     except Exception:
         pass
-
-    # Try fallback selector
     try:
         page.wait_for_selector("table.calendar", timeout=10_000)
-        log.debug("Calendar table found via table.calendar")
+        log.debug("Calendar table found (fallback selector).")
         return True
     except Exception:
         pass
-
-    # Log what we actually got for debugging
     title = page.title()
     current_url = page.url
     log.error(
-        f"Calendar table NOT found. "
-        f"Page title='{title}' | URL='{current_url}' — "
-        f"Possible Cloudflare block or FF layout change."
+        f"Calendar table NOT found. title='{title}' url='{current_url}' "
+        f"— possible Cloudflare block or FF layout change."
     )
-
-    # Save page HTML snippet for debugging
     try:
-        html_snippet = page.content()[:500]
-        log.debug(f"Page HTML snippet: {html_snippet}")
+        log.debug(f"Page HTML snippet: {page.content()[:500]}")
     except Exception:
         pass
-
     return False
 
 
@@ -344,6 +297,7 @@ class ChannelScraper:
                 "Set DEST_CHANNELS (comma-separated) or DEST_CHANNEL in environment."
             )
         log.info(f"📤  Posting to {len(self._dest_channels)} destination channel(s): {self._dest_channels}")
+        log.info(f"🧪  TEST_MODE = {TEST_MODE}")
 
         self._sources = config["source_channels"]
         self._min_delay = config["min_delay_seconds"]
@@ -355,6 +309,10 @@ class ChannelScraper:
         self._weekly_posted_date: Optional[str] = None
         self._today_screenshot_phash: Optional[str] = None
         self._today_screenshot_date: Optional[str] = None
+
+        # In TEST_MODE track if briefing already ran this process session
+        self._test_briefing_done: bool = False
+        self._test_weekly_done: bool = False
 
         session_string = config.get("session_string", "").strip()
         if session_string:
@@ -391,7 +349,7 @@ class ChannelScraper:
                 if not await self._client.is_user_authorized():
                     log.error("Session expired after reconnect.")
                     return False
-                log.info("✅  Reconnected successfully.")
+                log.info("✅  Reconnected.")
             except Exception as exc:
                 log.error(f"Reconnect failed: {exc}")
                 return False
@@ -473,7 +431,7 @@ class ChannelScraper:
             f"Poll cycle | sources={len(self._sources)} | "
             f"hashes={stats['tracked_hashes']} | "
             f"posted_24h={stats['posted_last_24h']} | "
-            f"reminders_today={stats.get('pending_reminders', 0)}"
+            f"test_mode={TEST_MODE}"
         )
         if not await self._ensure_connected():
             log.warning("Skipping poll cycle — not connected.")
@@ -495,12 +453,28 @@ class ChannelScraper:
     async def _check_daily_briefing(self):
         now = _eat_now()
         today_str = _eat_today_str()
-        if not (7 <= now.hour < 9):
-            return
-        if await self._mem.has_daily_briefing(today_str):
-            return
 
-        log.info(f"📅  Daily briefing time! Scraping ForexFactory for {today_str} …")
+        if TEST_MODE:
+            # In test mode: run once per process session, skip DB check
+            if self._test_briefing_done:
+                return
+            log.info("🧪  TEST_MODE: bypassing time and date guards for daily briefing.")
+            # Clear today's briefing record so it re-posts cleanly
+            try:
+                await self._mem._db.execute(
+                    "DELETE FROM daily_briefings WHERE date_str=?", (today_str,)
+                )
+                await self._mem._db.commit()
+            except Exception as exc:
+                log.warning(f"Could not clear briefing record: {exc}")
+        else:
+            # Normal mode: only run between 7 AM and 9 AM
+            if not (7 <= now.hour < 9):
+                return
+            if await self._mem.has_daily_briefing(today_str):
+                return
+
+        log.info(f"📅  Scraping ForexFactory for {today_str} …")
         events = await self._scrape_forex_factory_today()
         log.info(f"Scrape returned {len(events)} total events.")
 
@@ -508,15 +482,17 @@ class ChannelScraper:
             e for e in events
             if e.get("currency", "").upper() == "USD" and e.get("impact") == "red"
         ]
-        log.info(f"USD Red events after filter: {len(usd_red)}")
+        log.info(f"USD Red events: {len(usd_red)}")
 
         if not usd_red:
             log.info("No USD Red events today — skipping daily briefing.")
             await self._mem.save_daily_briefing(today_str, -1, [])
+            if TEST_MODE:
+                self._test_briefing_done = True
             return
 
         for ev in usd_red:
-            log.info(f"  USD Red: {ev.get('time_12h')} | {ev.get('name')} | F:{ev.get('forecast')} P:{ev.get('previous')}")
+            log.info(f"  ✅ {ev.get('time_12h')} | {ev.get('name')} | F:{ev.get('forecast')} P:{ev.get('previous')}")
 
         self._todays_events = usd_red
         self._todays_vip_events = self._select_vip_events(usd_red)
@@ -527,7 +503,7 @@ class ChannelScraper:
             log.error("Failed to generate daily briefing text.")
             return
 
-        log.info("📸  Taking today's ForexFactory screenshot (USD Red only) …")
+        log.info("📸  Taking ForexFactory screenshot (USD Red only) …")
         screenshot = await self._take_forex_factory_screenshot_today()
 
         if screenshot:
@@ -544,6 +520,8 @@ class ChannelScraper:
         if sent:
             await self._mem.save_daily_briefing(today_str, sent.id, usd_red)
             log.info(f"📅  Daily briefing posted → msg_id={sent.id}")
+            if TEST_MODE:
+                self._test_briefing_done = True
         else:
             log.error("Failed to send daily briefing.")
 
@@ -601,9 +579,18 @@ class ChannelScraper:
                 continue
             if await self._mem.has_reminder_been_sent(event_key):
                 continue
+
             event_time_str = event.get("time_24h", "")
             if not event_time_str:
                 continue
+
+            if TEST_MODE:
+                # In test mode fire the reminder immediately — no time window check
+                log.info(f"🧪  TEST_MODE: firing reminder immediately for {event.get('name')}")
+                await self._send_reminder(event, event_key, briefing_msg_id, today_str)
+                await asyncio.sleep(2)
+                continue
+
             try:
                 event_time = datetime.strptime(
                     f"{now.strftime('%Y-%m-%d')} {event_time_str}", "%Y-%m-%d %H:%M"
@@ -639,21 +626,31 @@ class ChannelScraper:
 
     async def _check_weekly_outlook(self):
         now = _eat_now()
-        if now.weekday() != 6 or now.hour != 21:
-            return
-        week_key = now.strftime("%Y-%W")
-        if self._weekly_posted_date == week_key:
-            return
 
-        log.info("📆  Sunday weekly outlook time!")
+        if TEST_MODE:
+            if self._test_weekly_done:
+                return
+            log.info("🧪  TEST_MODE: running weekly outlook immediately.")
+        else:
+            if now.weekday() != 6 or now.hour != 21:
+                return
+            week_key = now.strftime("%Y-%W")
+            if self._weekly_posted_date == week_key:
+                return
+
+        week_key = now.strftime("%Y-%W")
+
+        log.info("📆  Scraping ForexFactory for the week …")
         events = await self._scrape_forex_factory_week()
         usd_red = [
             e for e in events
             if e.get("currency", "").upper() == "USD" and e.get("impact") == "red"
         ]
         if not usd_red:
-            log.info("No USD Red events this week — skipping.")
+            log.info("No USD Red events this week — skipping weekly outlook.")
             self._weekly_posted_date = week_key
+            if TEST_MODE:
+                self._test_weekly_done = True
             return
 
         week_start = now + timedelta(days=1)
@@ -671,6 +668,8 @@ class ChannelScraper:
 
         if sent:
             self._weekly_posted_date = week_key
+            if TEST_MODE:
+                self._test_weekly_done = True
             log.info(f"📆  Weekly outlook posted → msg_id={sent.id}")
 
     # ── ForexFactory Async Wrappers ────────────────────────────────────────────
@@ -701,7 +700,6 @@ class ChannelScraper:
                     return []
                 events = self._extract_events_from_page(page)
                 browser.close()
-                log.info(f"Today scrape: {len(events)} events extracted.")
                 return events
         except Exception as exc:
             log.error(f"Playwright today scrape failed: {exc}", exc_info=True)
@@ -721,7 +719,6 @@ class ChannelScraper:
                     return []
                 events = self._extract_events_from_page(page)
                 browser.close()
-                log.info(f"Week scrape: {len(events)} events extracted.")
                 return events
         except Exception as exc:
             log.error(f"Playwright week scrape failed: {exc}", exc_info=True)
@@ -744,13 +741,13 @@ class ChannelScraper:
                 table = page.query_selector(".calendar__table")
                 if table:
                     screenshot_bytes = table.screenshot(type="png")
-                    log.info(f"Today screenshot from table element: {len(screenshot_bytes):,} bytes")
                 else:
-                    log.warning("Table element not found — falling back to viewport screenshot.")
+                    log.warning("Table not found — using viewport screenshot.")
                     screenshot_bytes = page.screenshot(
                         clip={"x": 0, "y": 0, "width": 1280, "height": 1000}, type="png"
                     )
                 browser.close()
+                log.info(f"Today screenshot: {len(screenshot_bytes):,} bytes")
                 return screenshot_bytes
         except Exception as exc:
             log.error(f"Playwright today screenshot failed: {exc}", exc_info=True)
@@ -773,11 +770,10 @@ class ChannelScraper:
                 table = page.query_selector(".calendar__table")
                 if table:
                     screenshot_bytes = table.screenshot(type="png")
-                    log.info(f"Week screenshot from table element: {len(screenshot_bytes):,} bytes")
                 else:
-                    log.warning("Table element not found — falling back to full-page screenshot.")
                     screenshot_bytes = page.screenshot(full_page=True, type="png")
                 browser.close()
+                log.info(f"Week screenshot: {len(screenshot_bytes):,} bytes")
                 return screenshot_bytes
         except Exception as exc:
             log.error(f"Playwright week screenshot failed: {exc}", exc_info=True)
@@ -786,27 +782,19 @@ class ChannelScraper:
     # ── Event Extraction ───────────────────────────────────────────────────────
 
     def _extract_events_from_page(self, page) -> List[dict]:
-        """
-        Extract events from the FF calendar page.
-        Tracks last seen currency across rows — FF reuses currency cells
-        for consecutive events of the same currency.
-        """
         events = []
         current_date = ""
         last_currency = ""
         try:
             rows = page.query_selector_all(".calendar__row--event")
-            log.debug(f"Found {len(rows)} calendar row elements.")
+            log.debug(f"Found {len(rows)} calendar rows.")
             for row in rows:
                 try:
-                    # Date cell
                     date_cell = row.query_selector(".calendar__cell.calendar__date")
                     if date_cell:
                         dt = date_cell.inner_text().strip()
                         if dt:
                             current_date = dt
-
-                    # Impact
                     impact_el = row.query_selector(".calendar__impact span")
                     if not impact_el:
                         continue
@@ -817,36 +805,22 @@ class ChannelScraper:
                         impact = "orange"
                     else:
                         continue
-
-                    # Currency — carry forward if cell is empty
                     currency_el = row.query_selector(".calendar__cell.calendar__currency")
                     if currency_el:
                         cur = currency_el.inner_text().strip()
                         if cur:
                             last_currency = cur
                     currency = last_currency or "—"
-
-                    # Time
                     time_el = row.query_selector(".calendar__cell.calendar__time")
                     time_raw = time_el.inner_text().strip() if time_el else ""
-
-                    # Event name
                     event_el = row.query_selector(".calendar__cell.calendar__event")
                     event_name = event_el.inner_text().strip() if event_el else "Unknown"
-
-                    # Forecast / Previous
                     forecast_el = row.query_selector(".calendar__cell.calendar__forecast")
                     forecast = (forecast_el.inner_text().strip() if forecast_el else "") or "—"
                     previous_el = row.query_selector(".calendar__cell.calendar__previous")
                     previous = (previous_el.inner_text().strip() if previous_el else "") or "—"
-
                     time_12h, time_24h = self._parse_ff_time(time_raw)
-
-                    log.debug(
-                        f"Row: {currency} | {impact} | {time_12h} | {event_name} "
-                        f"| F:{forecast} P:{previous}"
-                    )
-
+                    log.debug(f"Row: {currency} | {impact} | {time_12h} | {event_name}")
                     events.append({
                         "date": current_date,
                         "time_raw": time_raw,
@@ -921,7 +895,6 @@ class ChannelScraper:
         text = msg.text or msg.message or ""
         image_data: Optional[bytes] = None
         image_mime = "image/jpeg"
-
         if msg.media and _is_image(msg):
             try:
                 buf = io.BytesIO()
@@ -931,25 +904,21 @@ class ChannelScraper:
             except Exception as exc:
                 log.warning(f"Image download failed: {exc}")
 
-        # Layer 1 — exact content hash
         content_hash = self._mem.hash_combined(text, image_data)
         if await self._mem.is_duplicate(content_hash):
             log.info(f"[SKIP] Duplicate hash — {content_hash[:12]}…")
             return
 
-        # Layer 2 — perceptual hash (only if PIL available)
         if image_data and _PIL_AVAILABLE and _is_forex_factory_image(image_data):
             today_str = _eat_today_str()
             incoming_phash = _phash_image(image_data)
             if incoming_phash and self._today_screenshot_phash and self._today_screenshot_date == today_str:
                 dist = _phash_distance(incoming_phash, self._today_screenshot_phash)
-                log.info(f"FF phash distance: {dist} (threshold=12)")
                 if dist <= 12:
                     log.info(f"[SKIP] Near-duplicate FF screenshot (dist={dist}).")
                     await self._mem.mark_seen(content_hash, source=source_channel)
                     return
 
-        # Layer 3 — briefing keyword guard
         today_str = _eat_today_str()
         if image_data and await self._mem.has_daily_briefing(today_str):
             text_lower = text.lower()
@@ -961,17 +930,16 @@ class ChannelScraper:
                 await self._mem.mark_seen(content_hash, source=source_channel)
                 return
 
-        log.info(f"🔍  Analysing msg {msg.id} from {source_channel} | text={len(text)}c | image={'✅' if image_data else '❌'}")
+        log.info(f"🔍  Analysing msg {msg.id} from {source_channel}")
         verdict = await self._ai.analyse(text, image_data, image_mime)
         await self._mem.mark_seen(content_hash, source=source_channel)
 
         if not verdict.get("approved"):
-            log.info(f"[REJECTED] {verdict.get('reason')} | issues={verdict.get('issues')}")
+            log.info(f"[REJECTED] {verdict.get('reason')}")
             return
 
         post_text = self._build_post(verdict)
-        delay = random.uniform(self._min_delay, self._max_delay)
-        await asyncio.sleep(delay)
+        await asyncio.sleep(random.uniform(self._min_delay, self._max_delay))
         await self._simulate_typing(len(post_text))
         sent = await self._broadcast_media(post_text, image_data, image_mime)
         if sent is None:
