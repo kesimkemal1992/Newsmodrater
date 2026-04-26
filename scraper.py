@@ -165,6 +165,14 @@ def _eat_today_str() -> str:
     return _eat_now().strftime("%Y-%m-%d")
 
 
+def _clean_caption(text: str) -> str:
+    """Helper to remove EAT and truncate to Telegram limits."""
+    if not text:
+        return ""
+    text = text.replace("EAT", "").replace("E.A.T", "").strip()
+    return text[:1024]
+
+
 class ChannelScraper:
     def __init__(self, config: dict, ai_engine: AIEngine, memory: MemoryManager):
         self._cfg = config
@@ -248,9 +256,10 @@ class ChannelScraper:
     async def _broadcast_text(self, text: str):
         """Send plain text to ALL destination channels. Returns last sent message."""
         sent = None
+        safe_text = _clean_caption(text)
         for dest in self._dest_channels:
             try:
-                sent = await self._client.send_message(dest, text, parse_mode="md")
+                sent = await self._client.send_message(dest, safe_text, parse_mode="md")
                 log.info(f"  → Text sent to {dest} | msg_id={sent.id}")
             except ChatWriteForbiddenError:
                 log.error(f"❌  Cannot post to {dest} — check admin rights.")
@@ -258,7 +267,7 @@ class ChannelScraper:
                 log.warning(f"FloodWait {fwe.seconds}s on {dest} — sleeping …")
                 await asyncio.sleep(fwe.seconds + 3)
                 try:
-                    sent = await self._client.send_message(dest, text, parse_mode="md")
+                    sent = await self._client.send_message(dest, safe_text, parse_mode="md")
                 except Exception as exc:
                     log.error(f"Retry failed for {dest}: {exc}")
             except Exception as exc:
@@ -269,19 +278,20 @@ class ChannelScraper:
     async def _broadcast_file_with_caption(self, file_bytes: bytes, mime: str, caption: str):
         """Send a photo+caption to ALL destination channels. Returns last sent message."""
         sent = None
+        safe_caption = _clean_caption(caption)
         for dest in self._dest_channels:
             try:
                 ext = mimetypes.guess_extension(mime) or ".png"
                 buf = io.BytesIO(file_bytes)
                 buf.name = f"calendar{ext}"
                 buf.seek(0)
-                sent = await self._client.send_file(dest, buf, caption=caption, parse_mode="md", force_document=False)
+                sent = await self._client.send_file(dest, buf, caption=safe_caption, parse_mode="md", force_document=False)
                 log.info(f"  → File sent to {dest} | msg_id={sent.id}")
             except Exception as exc:
                 log.error(f"Send file error on {dest}: {exc}", exc_info=True)
                 log.info(f"Falling back to text-only for {dest}.")
                 try:
-                    sent = await self._client.send_message(dest, caption, parse_mode="md")
+                    sent = await self._client.send_message(dest, safe_caption, parse_mode="md")
                 except Exception as exc2:
                     log.error(f"Text fallback also failed for {dest}: {exc2}")
             await asyncio.sleep(1)
@@ -290,6 +300,7 @@ class ChannelScraper:
     async def _broadcast_media(self, text: str, image_data: Optional[bytes], image_mime: str):
         """Send news post (with or without image) to ALL destination channels."""
         sent = None
+        safe_text = _clean_caption(text)
         for dest in self._dest_channels:
             try:
                 if image_data:
@@ -297,9 +308,9 @@ class ChannelScraper:
                     ext = mimetypes.guess_extension(image_mime) or ".jpg"
                     buf.name = f"media{ext}"
                     buf.seek(0)
-                    sent = await self._client.send_file(dest, buf, caption=text, parse_mode="md")
+                    sent = await self._client.send_file(dest, buf, caption=safe_text, parse_mode="md")
                 else:
-                    sent = await self._client.send_message(dest, text, parse_mode="md")
+                    sent = await self._client.send_message(dest, safe_text, parse_mode="md")
                 log.info(f"  → Post sent to {dest} | msg_id={sent.id}")
             except ChatWriteForbiddenError:
                 log.error(f"❌  Cannot post to {dest} — check admin rights.")
@@ -307,7 +318,7 @@ class ChannelScraper:
                 log.warning(f"FloodWait {fwe.seconds}s on {dest} — retrying …")
                 await asyncio.sleep(fwe.seconds + 3)
                 try:
-                    sent = await self._client.send_message(dest, text, parse_mode="md")
+                    sent = await self._client.send_message(dest, safe_text, parse_mode="md")
                 except Exception as exc:
                     log.error(f"Retry failed for {dest}: {exc}")
             except Exception as exc:
@@ -458,11 +469,13 @@ class ChannelScraper:
         if not alert_text:
             log.error(f"Failed to generate alert for {event.get('name')}")
             return
+        
+        safe_alert = _clean_caption(alert_text)
         # Alerts are sent as REPLIES to the briefing in all dest channels
         for dest in self._dest_channels:
             try:
                 sent = await self._client.send_message(
-                    dest, alert_text, parse_mode="md", reply_to=reply_to_msg_id
+                    dest, safe_alert, parse_mode="md", reply_to=reply_to_msg_id
                 )
                 if sent:
                     log.info(f"🚨  Reminder sent to {dest} → msg_id={sent.id}")
@@ -508,29 +521,29 @@ class ChannelScraper:
 
     # ── ForexFactory Async Wrappers ────────────────────────────────────────────
     async def _scrape_forex_factory_today(self) -> List[dict]:
-        return await asyncio.get_event_loop().run_in_executor(None, self._playwright_scrape_today)
+        return await self._playwright_scrape_today()
 
     async def _scrape_forex_factory_week(self) -> List[dict]:
-        return await asyncio.get_event_loop().run_in_executor(None, self._playwright_scrape_week)
+        return await self._playwright_scrape_week()
 
     async def _take_forex_factory_screenshot_today(self) -> Optional[bytes]:
-        return await asyncio.get_event_loop().run_in_executor(None, self._playwright_screenshot_today)
+        return await self._playwright_screenshot_today()
 
     async def _take_forex_factory_screenshot_week(self) -> Optional[bytes]:
-        return await asyncio.get_event_loop().run_in_executor(None, self._playwright_screenshot_week)
+        return await self._playwright_screenshot_week()
 
     # ── Playwright: Today Scrape ───────────────────────────────────────────────
-    def _playwright_scrape_today(self) -> List[dict]:
+    async def _playwright_scrape_today(self) -> List[dict]:
         try:
-            from playwright.sync_api import sync_playwright
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"])
-                context = browser.new_context(locale="en-US", timezone_id="Africa/Addis_Ababa", user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-                page = context.new_page()
-                page.goto("https://www.forexfactory.com/calendar?day=today", timeout=30_000)
-                page.wait_for_selector(".calendar__table", timeout=15_000)
-                events = self._extract_events_from_page(page)
-                browser.close()
+            from playwright.async_api import async_playwright
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"])
+                context = await browser.new_context(locale="en-US", timezone_id="Africa/Addis_Ababa", user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+                page = await context.new_page()
+                await page.goto("https://www.forexfactory.com/calendar?day=today", timeout=30_000)
+                await page.wait_for_selector(".calendar__table", timeout=15_000)
+                events = await self._extract_events_from_page(page)
+                await browser.close()
                 log.info(f"Today scrape: {len(events)} high-impact events found.")
                 return events
         except Exception as exc:
@@ -538,74 +551,86 @@ class ChannelScraper:
             return []
 
     # ── Playwright: Week Scrape ────────────────────────────────────────────────
-    def _playwright_scrape_week(self) -> List[dict]:
+    async def _playwright_scrape_week(self) -> List[dict]:
         try:
-            from playwright.sync_api import sync_playwright
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"])
-                context = browser.new_context(locale="en-US", timezone_id="Africa/Addis_Ababa", user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-                page = context.new_page()
-                page.goto("https://www.forexfactory.com/calendar", timeout=30_000)
-                page.wait_for_selector(".calendar__table", timeout=15_000)
-                events = self._extract_events_from_page(page)
-                browser.close()
+            from playwright.async_api import async_playwright
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"])
+                context = await browser.new_context(locale="en-US", timezone_id="Africa/Addis_Ababa", user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+                page = await context.new_page()
+                await page.goto("https://www.forexfactory.com/calendar", timeout=30_000)
+                await page.wait_for_selector(".calendar__table", timeout=15_000)
+                events = await self._extract_events_from_page(page)
+                await browser.close()
                 log.info(f"Week scrape: {len(events)} high-impact events found.")
                 return events
         except Exception as exc:
             log.error(f"Playwright week scrape failed: {exc}", exc_info=True)
             return []
 
-    # ── Playwright: Today Screenshot ───────────────────────────────────────────
-    def _playwright_screenshot_today(self) -> Optional[bytes]:
+    # ── Playwright: Today Screenshot (USD ONLY) ────────────────────────────────
+    async def _playwright_screenshot_today(self) -> Optional[bytes]:
         try:
-            from playwright.sync_api import sync_playwright
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"])
-                context = browser.new_context(locale="en-US", timezone_id="Africa/Addis_Ababa", viewport={"width": 1280, "height": 1000}, user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-                page = context.new_page()
-                page.goto("https://www.forexfactory.com/calendar?day=today", timeout=30_000)
-                page.wait_for_selector(".calendar__table", timeout=15_000)
-                page.evaluate("""
+            from playwright.async_api import async_playwright
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"])
+                context = await browser.new_context(locale="en-US", timezone_id="Africa/Addis_Ababa", viewport={"width": 1280, "height": 1000}, user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+                page = await context.new_page()
+                await page.goto("https://www.forexfactory.com/calendar?day=today", timeout=30_000)
+                await page.wait_for_selector(".calendar__table", timeout=15_000)
+                await page.evaluate("""
                     document.querySelectorAll('.calendar__row').forEach(row => {
                         const imp = row.querySelector('.calendar__impact span');
+                        const curr = row.querySelector('.calendar__currency');
+                        let hide = false;
                         if (imp) {
                             const cls = imp.className;
-                            if (!cls.includes('high') && !cls.includes('medium')) { row.style.display = 'none'; }
+                            if (!cls.includes('high') && !cls.includes('medium')) { hide = true; }
                         }
+                        if (curr && curr.innerText.trim().toUpperCase() !== 'USD') {
+                            hide = true;
+                        }
+                        if (hide) { row.style.display = 'none'; }
                     });
                     document.querySelectorAll('.calendar__row--day-breaker').forEach(r => { r.style.display = 'none'; });
                 """)
-                table = page.query_selector(".calendar__table")
-                screenshot_bytes = table.screenshot(type="png") if table else page.screenshot(clip={"x": 0, "y": 0, "width": 1280, "height": 1000}, type="png")
-                browser.close()
+                table = await page.query_selector(".calendar__table")
+                screenshot_bytes = await table.screenshot(type="png") if table else await page.screenshot(clip={"x": 0, "y": 0, "width": 1280, "height": 1000}, type="png")
+                await browser.close()
                 log.info(f"Today screenshot: {len(screenshot_bytes):,} bytes")
                 return screenshot_bytes
         except Exception as exc:
             log.error(f"Playwright today screenshot failed: {exc}", exc_info=True)
             return None
 
-    # ── Playwright: Week Screenshot ────────────────────────────────────────────
-    def _playwright_screenshot_week(self) -> Optional[bytes]:
+    # ── Playwright: Week Screenshot (USD ONLY) ─────────────────────────────────
+    async def _playwright_screenshot_week(self) -> Optional[bytes]:
         try:
-            from playwright.sync_api import sync_playwright
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"])
-                context = browser.new_context(locale="en-US", timezone_id="Africa/Addis_Ababa", viewport={"width": 1280, "height": 1800}, user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
-                page = context.new_page()
-                page.goto("https://www.forexfactory.com/calendar", timeout=30_000)
-                page.wait_for_selector(".calendar__table", timeout=15_000)
-                page.evaluate("""
+            from playwright.async_api import async_playwright
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"])
+                context = await browser.new_context(locale="en-US", timezone_id="Africa/Addis_Ababa", viewport={"width": 1280, "height": 1800}, user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+                page = await context.new_page()
+                await page.goto("https://www.forexfactory.com/calendar", timeout=30_000)
+                await page.wait_for_selector(".calendar__table", timeout=15_000)
+                await page.evaluate("""
                     document.querySelectorAll('.calendar__row').forEach(row => {
                         const imp = row.querySelector('.calendar__impact span');
+                        const curr = row.querySelector('.calendar__currency');
+                        let hide = false;
                         if (imp) {
                             const cls = imp.className;
-                            if (!cls.includes('high') && !cls.includes('medium')) { row.style.display = 'none'; }
+                            if (!cls.includes('high') && !cls.includes('medium')) { hide = true; }
                         }
+                        if (curr && curr.innerText.trim().toUpperCase() !== 'USD') {
+                            hide = true;
+                        }
+                        if (hide) { row.style.display = 'none'; }
                     });
                 """)
-                table = page.query_selector(".calendar__table")
-                screenshot_bytes = table.screenshot(type="png") if table else page.screenshot(full_page=True, type="png")
-                browser.close()
+                table = await page.query_selector(".calendar__table")
+                screenshot_bytes = await table.screenshot(type="png") if table else await page.screenshot(full_page=True, type="png")
+                await browser.close()
                 log.info(f"Week screenshot: {len(screenshot_bytes):,} bytes")
                 return screenshot_bytes
         except Exception as exc:
@@ -613,38 +638,38 @@ class ChannelScraper:
             return None
 
     # ── Event Extraction ───────────────────────────────────────────────────────
-    def _extract_events_from_page(self, page) -> List[dict]:
+    async def _extract_events_from_page(self, page) -> List[dict]:
         events = []
         current_date = ""
         try:
-            rows = page.query_selector_all(".calendar__row--event")
+            rows = await page.query_selector_all(".calendar__row--event")
             for row in rows:
                 try:
-                    date_cell = row.query_selector(".calendar__cell.calendar__date")
+                    date_cell = await row.query_selector(".calendar__cell.calendar__date")
                     if date_cell:
-                        date_text = date_cell.inner_text().strip()
+                        date_text = (await date_cell.inner_text()).strip()
                         if date_text:
                             current_date = date_text
-                    impact_el = row.query_selector(".calendar__impact span")
+                    impact_el = await row.query_selector(".calendar__impact span")
                     if not impact_el:
                         continue
-                    impact_class = impact_el.get_attribute("class") or ""
+                    impact_class = await impact_el.get_attribute("class") or ""
                     if "high" in impact_class:
                         impact = "red"
                     elif "medium" in impact_class:
                         impact = "orange"
                     else:
                         continue
-                    time_el = row.query_selector(".calendar__cell.calendar__time")
-                    time_raw = time_el.inner_text().strip() if time_el else ""
-                    currency_el = row.query_selector(".calendar__cell.calendar__currency")
-                    currency = currency_el.inner_text().strip() if currency_el else "—"
-                    event_el = row.query_selector(".calendar__cell.calendar__event")
-                    event_name = event_el.inner_text().strip() if event_el else "Unknown"
-                    forecast_el = row.query_selector(".calendar__cell.calendar__forecast")
-                    forecast = (forecast_el.inner_text().strip() if forecast_el else "") or "—"
-                    previous_el = row.query_selector(".calendar__cell.calendar__previous")
-                    previous = (previous_el.inner_text().strip() if previous_el else "") or "—"
+                    time_el = await row.query_selector(".calendar__cell.calendar__time")
+                    time_raw = (await time_el.inner_text()).strip() if time_el else ""
+                    currency_el = await row.query_selector(".calendar__cell.calendar__currency")
+                    currency = (await currency_el.inner_text()).strip() if currency_el else "—"
+                    event_el = await row.query_selector(".calendar__cell.calendar__event")
+                    event_name = (await event_el.inner_text()).strip() if event_el else "Unknown"
+                    forecast_el = await row.query_selector(".calendar__cell.calendar__forecast")
+                    forecast = ((await forecast_el.inner_text()).strip() if forecast_el else "") or "—"
+                    previous_el = await row.query_selector(".calendar__cell.calendar__previous")
+                    previous = ((await previous_el.inner_text()).strip() if previous_el else "") or "—"
                     time_12h, time_24h = self._parse_ff_time(time_raw)
                     events.append({"date": current_date, "time_raw": time_raw, "time_12h": time_12h, "time_24h": time_24h, "currency": currency, "name": event_name, "impact": impact, "forecast": forecast, "previous": previous})
                 except Exception as exc:
@@ -702,7 +727,7 @@ class ChannelScraper:
             await asyncio.sleep(random.uniform(2, 6))
         await self._mem.set_last_msg_id(channel, new_last_id)
 
-    # ── Per-message handler ────────────────────────────────────────────────────
+    # ── Per-message handler (Double Duplicate Check Added) ─────────────────────
     async def _handle_message(self, msg, source_channel: str):
         text = msg.text or msg.message or ""
         image_data: Optional[bytes] = None
@@ -716,24 +741,53 @@ class ChannelScraper:
                 log.debug(f"Image: {len(image_data):,} bytes | mime={image_mime}")
             except Exception as exc:
                 log.warning(f"Image download failed: {exc}")
-        content_hash = self._mem.hash_combined(text, image_data)
-        if await self._mem.is_duplicate(content_hash):
-            log.info(f"[SKIP] Duplicate — hash={content_hash[:12]}…")
+        
+        # ── Double Verification Duplicate Check ──
+        is_duplicate = False
+        text_hash = None
+        img_hash = None
+        
+        if text:
+            text_hash = self._mem.hash_combined(text, None)
+            if await self._mem.is_duplicate(text_hash):
+                is_duplicate = True
+                
+        if image_data:
+            img_hash = self._mem.hash_combined("", image_data)
+            if await self._mem.is_duplicate(img_hash):
+                is_duplicate = True
+
+        if is_duplicate:
+            log.info(f"[SKIP] Duplicate detected — Text or Image already seen.")
             return
+
+        # Mark Both as seen individually to strictly prevent future duplicates
+        if text_hash:
+            await self._mem.mark_seen(text_hash, source=source_channel)
+        if img_hash:
+            await self._mem.mark_seen(img_hash, source=source_channel)
+
         log.info(f"🔍  Analysing msg {msg.id} from {source_channel} | text={len(text)}c | image={'✅' if image_data else '❌'}")
         verdict = await self._ai.analyse(text, image_data, image_mime)
-        await self._mem.mark_seen(content_hash, source=source_channel)
+        
+        # Legacy single hash keeping for log_posted backwards compatibility
+        content_hash = self._mem.hash_combined(text, image_data)
+        
         if not verdict.get("approved"):
             log.info(f"[REJECTED] engine={verdict.get('engine')} | reason='{verdict.get('reason')}' | issues={verdict.get('issues')}")
             return
+        
         post_text = self._build_post(verdict)
+        
         delay = random.uniform(self._min_delay, self._max_delay)
         log.info(f"⏳  Waiting {delay:.1f}s before posting …")
         await asyncio.sleep(delay)
         await self._simulate_typing(len(post_text))
+        
         sent = await self._broadcast_media(post_text, image_data, image_mime)
         if sent is None:
             return
+            
         await self._mem.log_posted(source_channel=source_channel, source_msg_id=msg.id, dest_msg_id=sent.id, content_hash=content_hash, ai_verdict=verdict, formatted_text=post_text)
         log.info(f"✅  Posted → msg_id={sent.id} | engine={verdict.get('engine')} | confidence={verdict.get('confidence')}")
 
