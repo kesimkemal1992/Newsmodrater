@@ -11,6 +11,7 @@ Features:
     — Lower-priority events are SKIPPED if a VIP event comes later that day
   • Posts Weekly Outlook every Sunday at 09:00 PM EAT as PHOTO + caption
   • Auto-reconnect on Telethon ConnectionError
+  • Posts to MULTIPLE destination channels (DEST_CHANNELS env var, comma-separated)
 
 Timezone: Africa/Addis_Ababa (GMT+3) — EAT.
 """
@@ -39,38 +40,103 @@ EAT = pytz.timezone("Africa/Addis_Ababa")
 
 _IMG_MIMES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
 
-# ── Priority keywords — these events ALWAYS claim the 2 reminder slots ─────────
-# If today has any of these, lower-priority events are SKIPPED entirely
+# ── Reminder eligibility rules ─────────────────────────────────────────────────
+#
+# A reminder is sent when these conditions are met:
+#
+#   STANDARD events (NFP, CPI, GDP, Unemployment, Retail Sales, Gold/XAU):
+#     1. Currency = USD  OR  event name contains Gold / XAU
+#     2. Impact = Red 🔴 only
+#     3. Both Forecast AND Previous must be real values (not "—" or empty)
+#
+#   FOMC / FEDERAL RESERVE events (special — no data required):
+#     1. Event name contains FOMC / Federal / Fed Chair / Powell keywords
+#     2. Impact = Red 🔴 only
+#     3. Forecast and Previous are NOT required — shown only if available
+#
+# Within eligible events, Tier 1 keywords rank first for the Top 2 slots.
+
+# Tier 1 priority keywords — rank first within eligible events
 _PRIORITY_KEYWORDS = [
+    "fomc", "federal open market committee",
+    "interest rate decision", "rate decision",
+    "nfp", "non-farm payroll", "non-farm payrolls",
+    "cpi", "consumer price index",
+    "pce", "core pce",
+    "gdp",
+    "fed chair", "powell speaks", "jerome powell",
+    "unemployment rate",
+    "retail sales",
+    "gold", "xau",
+]
+
+# FOMC / Federal Reserve keywords — these bypass the Forecast+Previous requirement
+_FOMC_KEYWORDS = (
     "fomc",
     "federal open market committee",
-    "interest rate decision",
+    "federal reserve",
+    "fed rate",
     "rate decision",
-    "nfp",
-    "non-farm payroll",
-    "non-farm payrolls",
-    "cpi",
-    "consumer price index",
-    "pce",
-    "core pce",
-    "gdp",
+    "interest rate decision",
     "fed chair",
     "powell speaks",
     "jerome powell",
-    "bank of england",
-    "boe rate",
-    "ecb rate",
-    "european central bank",
-    "boj rate",
-    "bank of japan",
-    "rba rate",
-    "bank of canada",
-    "unemployment rate",
-    "retail sales",
-]
+    "fomc statement",
+    "fomc minutes",
+    "fomc meeting",
+    "fomc press",
+)
+
+# Currencies that qualify for standard reminders
+_REMINDER_CURRENCIES = {"USD"}
+
+# Gold / XAU name keywords
+_GOLD_KEYWORDS = ("gold", "xau")
+
+
+def _is_fomc_event(event_name: str) -> bool:
+    """True if this is a FOMC / Federal Reserve event — no data requirement."""
+    name_lower = event_name.lower()
+    return any(kw in name_lower for kw in _FOMC_KEYWORDS)
+
+
+def _is_reminder_eligible(event: dict) -> bool:
+    """
+    Returns True if this event should get a 10-minute reminder.
+
+    FOMC / Federal events: pass with Red impact only (no data needed).
+    All other USD / Gold events: need Red + real Forecast + real Previous.
+    """
+    currency = event.get("currency", "").upper().strip()
+    name_lower = event.get("name", "").lower()
+
+    # Condition: Red impact — required for ALL events
+    if event.get("impact") != "red":
+        return False
+
+    # ── FOMC / Federal Reserve — bypass data requirement ──────────────────────
+    if _is_fomc_event(event.get("name", "")):
+        return True
+
+    # ── Standard USD / Gold events — require Forecast + Previous ─────────────
+    is_usd = currency == "USD"
+    is_gold = any(kw in name_lower for kw in _GOLD_KEYWORDS)
+    if not (is_usd or is_gold):
+        return False
+
+    # Both Forecast AND Previous must be real values
+    forecast = event.get("forecast", "").strip()
+    previous = event.get("previous", "").strip()
+    has_forecast = bool(forecast and forecast != "—")
+    has_previous = bool(previous and previous != "—")
+    if not (has_forecast and has_previous):
+        return False
+
+    return True
 
 
 def _is_priority_event(event_name: str) -> bool:
+    """Tier 1 ranking within already-eligible events."""
     name_lower = event_name.lower()
     return any(kw in name_lower for kw in _PRIORITY_KEYWORDS)
 
@@ -104,17 +170,35 @@ class ChannelScraper:
         self._cfg = config
         self._ai = ai_engine
         self._mem = memory
-        self._dest = config["dest_channel"]
+
+        # ── Multi-destination channel support ──────────────────────────────────
+        # DEST_CHANNELS (comma-separated) takes priority over DEST_CHANNEL.
+        # Both are parsed in main.py and stored as a list in config["dest_channels"].
+        self._dest_channels: List[str] = config.get("dest_channels", [])
+        if not self._dest_channels:
+            # Fallback: single channel from legacy key
+            single = config.get("dest_channel", "")
+            if single:
+                self._dest_channels = [single]
+
+        if not self._dest_channels:
+            raise ValueError(
+                "No destination channels configured. "
+                "Set DEST_CHANNELS (comma-separated) or DEST_CHANNEL in environment."
+            )
+
+        log.info(f"📤  Posting to {len(self._dest_channels)} destination channel(s): {self._dest_channels}")
+
         self._sources = config["source_channels"]
         self._min_delay = config["min_delay_seconds"]
         self._max_delay = config["max_delay_seconds"]
         self._lookback_hours = config["lookback_hours"]
 
-        # In-memory state for today's events and VIP reservation list
+        # In-memory state
         self._todays_events: List[dict] = []
-        self._todays_vip_events: List[dict] = []   # Top 2 reserved for reminders
+        self._todays_vip_events: List[dict] = []
         self._daily_briefing_posted_date: Optional[str] = None
-        self._weekly_posted_date: Optional[str] = None  # "YYYY-WW"
+        self._weekly_posted_date: Optional[str] = None
 
         # ── Session setup ──────────────────────────────────────────────────────
         session_string = config.get("session_string", "").strip()
@@ -125,11 +209,7 @@ class ChannelScraper:
             session = config.get("session_name", "manager_session")
             log.info(f"Using file session: {session}.session")
 
-        self._client = TelegramClient(
-            session,
-            config["api_id"],
-            config["api_hash"],
-        )
+        self._client = TelegramClient(session, config["api_id"], config["api_hash"])
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
     async def start(self):
@@ -144,7 +224,6 @@ class ChannelScraper:
         else:
             phone = self._cfg.get("phone", "")
             await self._client.start(phone=phone if phone else None)
-
         me = await self._client.get_me()
         log.info(f"✅  Logged in as: {me.first_name} (@{me.username or me.id})")
 
@@ -152,19 +231,89 @@ class ChannelScraper:
         await self._client.disconnect()
 
     async def _ensure_connected(self) -> bool:
-        """Reconnect Telethon client if disconnected. Returns True if connected."""
         if not self._client.is_connected():
             log.warning("Telethon disconnected — reconnecting …")
             try:
                 await self._client.connect()
                 if not await self._client.is_user_authorized():
-                    log.error("Session expired after reconnect — cannot reauthorize automatically.")
+                    log.error("Session expired after reconnect.")
                     return False
                 log.info("✅  Reconnected successfully.")
             except Exception as exc:
                 log.error(f"Reconnect failed: {exc}")
                 return False
         return True
+
+    # ── Multi-channel broadcast helpers ───────────────────────────────────────
+    async def _broadcast_text(self, text: str):
+        """Send plain text to ALL destination channels. Returns last sent message."""
+        sent = None
+        for dest in self._dest_channels:
+            try:
+                sent = await self._client.send_message(dest, text, parse_mode="md")
+                log.info(f"  → Text sent to {dest} | msg_id={sent.id}")
+            except ChatWriteForbiddenError:
+                log.error(f"❌  Cannot post to {dest} — check admin rights.")
+            except FloodWaitError as fwe:
+                log.warning(f"FloodWait {fwe.seconds}s on {dest} — sleeping …")
+                await asyncio.sleep(fwe.seconds + 3)
+                try:
+                    sent = await self._client.send_message(dest, text, parse_mode="md")
+                except Exception as exc:
+                    log.error(f"Retry failed for {dest}: {exc}")
+            except Exception as exc:
+                log.error(f"Send text error on {dest}: {exc}", exc_info=True)
+            await asyncio.sleep(1)
+        return sent
+
+    async def _broadcast_file_with_caption(self, file_bytes: bytes, mime: str, caption: str):
+        """Send a photo+caption to ALL destination channels. Returns last sent message."""
+        sent = None
+        for dest in self._dest_channels:
+            try:
+                ext = mimetypes.guess_extension(mime) or ".png"
+                buf = io.BytesIO(file_bytes)
+                buf.name = f"calendar{ext}"
+                buf.seek(0)
+                sent = await self._client.send_file(dest, buf, caption=caption, parse_mode="md", force_document=False)
+                log.info(f"  → File sent to {dest} | msg_id={sent.id}")
+            except Exception as exc:
+                log.error(f"Send file error on {dest}: {exc}", exc_info=True)
+                log.info(f"Falling back to text-only for {dest}.")
+                try:
+                    sent = await self._client.send_message(dest, caption, parse_mode="md")
+                except Exception as exc2:
+                    log.error(f"Text fallback also failed for {dest}: {exc2}")
+            await asyncio.sleep(1)
+        return sent
+
+    async def _broadcast_media(self, text: str, image_data: Optional[bytes], image_mime: str):
+        """Send news post (with or without image) to ALL destination channels."""
+        sent = None
+        for dest in self._dest_channels:
+            try:
+                if image_data:
+                    buf = io.BytesIO(image_data)
+                    ext = mimetypes.guess_extension(image_mime) or ".jpg"
+                    buf.name = f"media{ext}"
+                    buf.seek(0)
+                    sent = await self._client.send_file(dest, buf, caption=text, parse_mode="md")
+                else:
+                    sent = await self._client.send_message(dest, text, parse_mode="md")
+                log.info(f"  → Post sent to {dest} | msg_id={sent.id}")
+            except ChatWriteForbiddenError:
+                log.error(f"❌  Cannot post to {dest} — check admin rights.")
+            except FloodWaitError as fwe:
+                log.warning(f"FloodWait {fwe.seconds}s on {dest} — retrying …")
+                await asyncio.sleep(fwe.seconds + 3)
+                try:
+                    sent = await self._client.send_message(dest, text, parse_mode="md")
+                except Exception as exc:
+                    log.error(f"Retry failed for {dest}: {exc}")
+            except Exception as exc:
+                log.error(f"Send error on {dest}: {exc}", exc_info=True)
+            await asyncio.sleep(1)
+        return sent
 
     # ── Main poll cycle ────────────────────────────────────────────────────────
     async def poll_and_forward(self):
@@ -175,17 +324,12 @@ class ChannelScraper:
             f"posted_24h={stats['posted_last_24h']} | "
             f"reminders_today={stats.get('pending_reminders', 0)}"
         )
-
         if not await self._ensure_connected():
             log.warning("Skipping poll cycle — not connected.")
             return
-
-        # Scheduler checks run every poll cycle
         await self._check_daily_briefing()
         await self._check_reminders()
         await self._check_weekly_outlook()
-
-        # Telegram channel scraping
         for channel in self._sources:
             try:
                 await self._process_channel(channel)
@@ -196,114 +340,83 @@ class ChannelScraper:
                 log.error(f"Error on channel {channel}: {exc}", exc_info=True)
                 await asyncio.sleep(5)
 
-    # ── Daily Briefing Scheduler ───────────────────────────────────────────────
+    # ── Daily Briefing ─────────────────────────────────────────────────────────
     async def _check_daily_briefing(self):
-        """Post daily briefing at 07:00 AM EAT as PHOTO + caption."""
         now = _eat_now()
         today_str = _eat_today_str()
-
-        # Post window: 07:00–09:00 EAT only
         if not (7 <= now.hour < 9):
             return
-
         if await self._mem.has_daily_briefing(today_str):
-            return  # Already posted today
-
+            return
         log.info(f"📅  Daily briefing time! Scraping ForexFactory for {today_str} …")
         events = await self._scrape_forex_factory_today()
-
         if not events:
             log.info("No high-impact events today — skipping daily briefing.")
             await self._mem.save_daily_briefing(today_str, -1, [])
             return
-
-        # Store events and compute VIP reservation list for reminders
         self._todays_events = events
         self._todays_vip_events = self._select_vip_events(events)
-        log.info(
-            f"VIP reminder slots reserved for: "
-            f"{[e.get('name') for e in self._todays_vip_events]}"
-        )
-
+        log.info(f"VIP reminder slots reserved for: {[e.get('name') for e in self._todays_vip_events]}")
         date_display = now.strftime("%A, %B %d, %Y")
         briefing_text = await self._ai.generate_daily_briefing(events, date_display)
-
         if not briefing_text:
             log.error("Failed to generate daily briefing text.")
             return
-
-        # Take today's screenshot and send as PHOTO + caption
         log.info("📸  Taking today's ForexFactory screenshot …")
         screenshot = await self._take_forex_factory_screenshot_today()
-
         if screenshot:
-            sent = await self._send_file_with_caption(screenshot, "image/png", briefing_text)
+            sent = await self._broadcast_file_with_caption(screenshot, "image/png", briefing_text)
         else:
             log.warning("Today screenshot failed — sending text only.")
-            sent = await self._send_text(briefing_text)
-
+            sent = await self._broadcast_text(briefing_text)
         if sent:
             await self._mem.save_daily_briefing(today_str, sent.id, events)
             log.info(f"📅  Daily briefing posted → msg_id={sent.id}")
         else:
             log.error("Failed to send daily briefing.")
 
-    # ── Look-Ahead VIP Event Selection ────────────────────────────────────────
+    # ── Look-Ahead VIP Selection ───────────────────────────────────────────────
     def _select_vip_events(self, events: List[dict]) -> List[dict]:
         """
-        Look-Ahead Priority Strategy:
-        Evaluate ALL of today's Red events. Sort by priority tier then time.
-        Reserve ONLY the Top 2 events for reminder slots.
-        Lower-priority events are excluded — they will never get a reminder slot
-        if a VIP event is scheduled later that day.
+        Filter and rank today's events for reminder slots.
 
-        Tier 1 (highest): _PRIORITY_KEYWORDS match (FOMC, NFP, CPI, Rate decisions etc.)
-        Tier 2: All other Red events
-        Orange events: Never get reminder slots — Red only.
+        Hard rules (ALL must pass via _is_reminder_eligible):
+          • Currency = USD  OR  event name contains Gold / XAU
+          • Impact   = Red only (Orange never alerted)
+          • Forecast AND Previous must both be real values (not dash)
+
+        Within passing events, Tier 1 keywords (NFP, CPI, FOMC, etc.)
+        rank first so they always claim the Top 2 slots.
         """
-        # Filter: Red impact only for reminders
-        red_events = [e for e in events if e.get("impact") == "red"]
+        eligible = [e for e in events if _is_reminder_eligible(e)]
 
-        if not red_events:
-            # No red events → fall back to orange if needed
-            red_events = events
+        if not eligible:
+            log.info("No reminder-eligible events today (need USD/Gold, Red, Forecast+Previous).")
+            return []
 
-        # Sort by: Tier 1 first, then by time
         def sort_key(event):
             is_priority = _is_priority_event(event.get("name", ""))
             time_str = event.get("time_24h", "99:99")
             return (0 if is_priority else 1, time_str)
 
-        sorted_events = sorted(red_events, key=sort_key)
-
-        # Reserve Top 2 slots
+        sorted_events = sorted(eligible, key=sort_key)
         vip = sorted_events[:2]
+
         log.info(
-            f"Look-Ahead: {len(red_events)} red events today. "
+            f"Look-Ahead: {len(eligible)} eligible event(s) (USD/Gold + Red + Forecast+Prev). "
             f"Top 2 VIP slots: {[e.get('name') for e in vip]}"
         )
         return vip
 
     # ── Reminder Scheduler ─────────────────────────────────────────────────────
     async def _check_reminders(self):
-        """
-        Check if any VIP event is 10 minutes away and post a reminder.
-        Uses the Look-Ahead reservation list — ONLY sends alerts for VIP events.
-        Max 2 per day enforced via memory DB.
-        """
         today_str = _eat_today_str()
-
-        # Check daily cap
         reminder_count = await self._mem.get_reminder_count_today(today_str)
         if reminder_count >= 2:
             return
-
-        # Get the briefing msg_id to reply to
         briefing_msg_id = await self._mem.get_daily_briefing_msg_id(today_str)
         if not briefing_msg_id or briefing_msg_id == -1:
             return
-
-        # Recover VIP events if in-memory list was lost (e.g. after restart)
         vip_events = self._todays_vip_events
         if not vip_events:
             async with self._mem._db.execute(
@@ -316,166 +429,105 @@ class ChannelScraper:
                 self._todays_vip_events = vip_events
             if not vip_events:
                 return
-
         now = _eat_now()
         now_naive = now.replace(tzinfo=None)
         slots_left = 2 - reminder_count
-
         for event in vip_events:
             if slots_left <= 0:
                 break
-
-            event_key = (
-                f"{today_str}_{event.get('name', '')}_{event.get('currency', '')}"
-            )
-
-            # Skip if reminder already sent for this event
+            event_key = f"{today_str}_{event.get('name', '')}_{event.get('currency', '')}"
             if await self._mem.has_reminder_been_sent(event_key):
                 continue
-
-            # Parse event time (24h stored in EAT)
             event_time_str = event.get("time_24h", "")
             if not event_time_str:
                 continue
             try:
-                event_time = datetime.strptime(
-                    f"{now.strftime('%Y-%m-%d')} {event_time_str}", "%Y-%m-%d %H:%M"
-                )
+                event_time = datetime.strptime(f"{now.strftime('%Y-%m-%d')} {event_time_str}", "%Y-%m-%d %H:%M")
             except ValueError:
                 continue
-
             minutes_until = (event_time - now_naive).total_seconds() / 60
-
-            # Trigger window: 8–12 minutes before (centred on 10 min)
             if 8 <= minutes_until <= 12:
                 await self._send_reminder(event, event_key, briefing_msg_id, today_str)
                 slots_left -= 1
                 await asyncio.sleep(2)
 
-    async def _send_reminder(
-        self,
-        event: dict,
-        event_key: str,
-        reply_to_msg_id: int,
-        today_str: str,
-    ):
-        """Generate and send a 10-minute reminder as a reply to the morning briefing."""
+    async def _send_reminder(self, event: dict, event_key: str, reply_to_msg_id: int, today_str: str):
         log.info(f"⏰  Sending 10-min reminder for: {event.get('name')}")
-        # Get rotating motivational line index from memory (cycles across all reminders)
         mot_index = await self._mem.get_and_increment_motivational_index()
         alert_text = await self._ai.generate_alert(event, motivational_index=mot_index)
-
         if not alert_text:
             log.error(f"Failed to generate alert for {event.get('name')}")
             return
-
-        try:
-            sent = await self._client.send_message(
-                self._dest,
-                alert_text,
-                parse_mode="md",
-                reply_to=reply_to_msg_id,
-            )
-            if sent:
-                await self._mem.mark_reminder_sent(event_key)
-                await self._mem.increment_reminder_count(today_str)
-                log.info(
-                    f"🚨  Reminder sent → msg_id={sent.id} "
-                    f"(reply to briefing msg {reply_to_msg_id})"
+        # Alerts are sent as REPLIES to the briefing in all dest channels
+        for dest in self._dest_channels:
+            try:
+                sent = await self._client.send_message(
+                    dest, alert_text, parse_mode="md", reply_to=reply_to_msg_id
                 )
-        except Exception as exc:
-            log.error(f"Failed to send reminder: {exc}", exc_info=True)
+                if sent:
+                    log.info(f"🚨  Reminder sent to {dest} → msg_id={sent.id}")
+            except Exception as exc:
+                log.error(f"Failed to send reminder to {dest}: {exc}", exc_info=True)
+            await asyncio.sleep(1)
+        await self._mem.mark_reminder_sent(event_key)
+        await self._mem.increment_reminder_count(today_str)
 
-    # ── Weekly Outlook Scheduler ───────────────────────────────────────────────
+    # ── Weekly Outlook ─────────────────────────────────────────────────────────
     async def _check_weekly_outlook(self):
-        """Post weekly outlook every Sunday at 21:00 EAT as PHOTO + caption."""
         now = _eat_now()
-        if now.weekday() != 6:  # 6 = Sunday
+        if now.weekday() != 6:
             return
         if now.hour != 21:
             return
-
         week_key = now.strftime("%Y-%W")
         if self._weekly_posted_date == week_key:
             return
-
         log.info("📆  Sunday weekly outlook time! Scraping ForexFactory for the week …")
         events = await self._scrape_forex_factory_week()
-
         if not events:
             log.info("No high-impact events this week — skipping weekly outlook.")
             self._weekly_posted_date = week_key
             return
-
-        week_start = now + timedelta(days=1)   # Monday
-        week_end = week_start + timedelta(days=4)  # Friday
-        week_range = (
-            f"{week_start.strftime('%b %d')} – {week_end.strftime('%b %d, %Y')}"
-        )
-
+        week_start = now + timedelta(days=1)
+        week_end = week_start + timedelta(days=4)
+        week_range = f"{week_start.strftime('%b %d')} – {week_end.strftime('%b %d, %Y')}"
         outlook_text = await self._ai.generate_weekly_outlook(events, week_range)
         if not outlook_text:
             log.error("Failed to generate weekly outlook.")
             return
-
-        # Take weekly screenshot and send as PHOTO + caption
         log.info("📸  Taking weekly ForexFactory screenshot …")
         screenshot = await self._take_forex_factory_screenshot_week()
-
         if screenshot:
-            sent = await self._send_file_with_caption(screenshot, "image/png", outlook_text)
+            sent = await self._broadcast_file_with_caption(screenshot, "image/png", outlook_text)
         else:
             log.warning("Weekly screenshot failed — sending text only.")
-            sent = await self._send_text(outlook_text)
-
+            sent = await self._broadcast_text(outlook_text)
         if sent:
             self._weekly_posted_date = week_key
             log.info(f"📆  Weekly outlook posted → msg_id={sent.id}")
 
     # ── ForexFactory Async Wrappers ────────────────────────────────────────────
     async def _scrape_forex_factory_today(self) -> List[dict]:
-        return await asyncio.get_event_loop().run_in_executor(
-            None, self._playwright_scrape_today
-        )
+        return await asyncio.get_event_loop().run_in_executor(None, self._playwright_scrape_today)
 
     async def _scrape_forex_factory_week(self) -> List[dict]:
-        return await asyncio.get_event_loop().run_in_executor(
-            None, self._playwright_scrape_week
-        )
+        return await asyncio.get_event_loop().run_in_executor(None, self._playwright_scrape_week)
 
     async def _take_forex_factory_screenshot_today(self) -> Optional[bytes]:
-        return await asyncio.get_event_loop().run_in_executor(
-            None, self._playwright_screenshot_today
-        )
+        return await asyncio.get_event_loop().run_in_executor(None, self._playwright_screenshot_today)
 
     async def _take_forex_factory_screenshot_week(self) -> Optional[bytes]:
-        return await asyncio.get_event_loop().run_in_executor(
-            None, self._playwright_screenshot_week
-        )
+        return await asyncio.get_event_loop().run_in_executor(None, self._playwright_screenshot_week)
 
     # ── Playwright: Today Scrape ───────────────────────────────────────────────
     def _playwright_scrape_today(self) -> List[dict]:
         try:
             from playwright.sync_api import sync_playwright
             with sync_playwright() as p:
-                browser = p.chromium.launch(
-                    headless=True,
-                    args=["--no-sandbox", "--disable-setuid-sandbox",
-                          "--disable-dev-shm-usage", "--disable-gpu"],
-                )
-                context = browser.new_context(
-                    locale="en-US",
-                    timezone_id="Africa/Addis_Ababa",
-                    user_agent=(
-                        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-                    ),
-                )
+                browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"])
+                context = browser.new_context(locale="en-US", timezone_id="Africa/Addis_Ababa", user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
                 page = context.new_page()
-                page.goto(
-                    "https://www.forexfactory.com/calendar?day=today",
-                    timeout=30_000,
-                )
+                page.goto("https://www.forexfactory.com/calendar?day=today", timeout=30_000)
                 page.wait_for_selector(".calendar__table", timeout=15_000)
                 events = self._extract_events_from_page(page)
                 browser.close()
@@ -490,24 +542,10 @@ class ChannelScraper:
         try:
             from playwright.sync_api import sync_playwright
             with sync_playwright() as p:
-                browser = p.chromium.launch(
-                    headless=True,
-                    args=["--no-sandbox", "--disable-setuid-sandbox",
-                          "--disable-dev-shm-usage", "--disable-gpu"],
-                )
-                context = browser.new_context(
-                    locale="en-US",
-                    timezone_id="Africa/Addis_Ababa",
-                    user_agent=(
-                        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-                    ),
-                )
+                browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"])
+                context = browser.new_context(locale="en-US", timezone_id="Africa/Addis_Ababa", user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
                 page = context.new_page()
-                page.goto(
-                    "https://www.forexfactory.com/calendar",
-                    timeout=30_000,
-                )
+                page.goto("https://www.forexfactory.com/calendar", timeout=30_000)
                 page.wait_for_selector(".calendar__table", timeout=15_000)
                 events = self._extract_events_from_page(page)
                 browser.close()
@@ -519,56 +557,26 @@ class ChannelScraper:
 
     # ── Playwright: Today Screenshot ───────────────────────────────────────────
     def _playwright_screenshot_today(self) -> Optional[bytes]:
-        """Screenshot ForexFactory today view — cropped to calendar table only."""
         try:
             from playwright.sync_api import sync_playwright
             with sync_playwright() as p:
-                browser = p.chromium.launch(
-                    headless=True,
-                    args=["--no-sandbox", "--disable-setuid-sandbox",
-                          "--disable-dev-shm-usage", "--disable-gpu"],
-                )
-                context = browser.new_context(
-                    locale="en-US",
-                    timezone_id="Africa/Addis_Ababa",
-                    viewport={"width": 1280, "height": 1000},
-                    user_agent=(
-                        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-                    ),
-                )
+                browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"])
+                context = browser.new_context(locale="en-US", timezone_id="Africa/Addis_Ababa", viewport={"width": 1280, "height": 1000}, user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
                 page = context.new_page()
-                page.goto(
-                    "https://www.forexfactory.com/calendar?day=today",
-                    timeout=30_000,
-                )
+                page.goto("https://www.forexfactory.com/calendar?day=today", timeout=30_000)
                 page.wait_for_selector(".calendar__table", timeout=15_000)
-
-                # Hide low-impact rows — keep Red + Orange only
                 page.evaluate("""
                     document.querySelectorAll('.calendar__row').forEach(row => {
                         const imp = row.querySelector('.calendar__impact span');
                         if (imp) {
                             const cls = imp.className;
-                            if (!cls.includes('high') && !cls.includes('medium')) {
-                                row.style.display = 'none';
-                            }
+                            if (!cls.includes('high') && !cls.includes('medium')) { row.style.display = 'none'; }
                         }
                     });
-                    document.querySelectorAll('.calendar__row--day-breaker').forEach(r => {
-                        r.style.display = 'none';
-                    });
+                    document.querySelectorAll('.calendar__row--day-breaker').forEach(r => { r.style.display = 'none'; });
                 """)
-
-                # Crop tightly to calendar table element
                 table = page.query_selector(".calendar__table")
-                if table:
-                    screenshot_bytes = table.screenshot(type="png")
-                else:
-                    screenshot_bytes = page.screenshot(
-                        clip={"x": 0, "y": 0, "width": 1280, "height": 1000},
-                        type="png",
-                    )
+                screenshot_bytes = table.screenshot(type="png") if table else page.screenshot(clip={"x": 0, "y": 0, "width": 1280, "height": 1000}, type="png")
                 browser.close()
                 log.info(f"Today screenshot: {len(screenshot_bytes):,} bytes")
                 return screenshot_bytes
@@ -578,51 +586,25 @@ class ChannelScraper:
 
     # ── Playwright: Week Screenshot ────────────────────────────────────────────
     def _playwright_screenshot_week(self) -> Optional[bytes]:
-        """Screenshot ForexFactory full week — used for Sunday weekly outlook."""
         try:
             from playwright.sync_api import sync_playwright
             with sync_playwright() as p:
-                browser = p.chromium.launch(
-                    headless=True,
-                    args=["--no-sandbox", "--disable-setuid-sandbox",
-                          "--disable-dev-shm-usage", "--disable-gpu"],
-                )
-                context = browser.new_context(
-                    locale="en-US",
-                    timezone_id="Africa/Addis_Ababa",
-                    viewport={"width": 1280, "height": 1800},
-                    user_agent=(
-                        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-                    ),
-                )
+                browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--disable-gpu"])
+                context = browser.new_context(locale="en-US", timezone_id="Africa/Addis_Ababa", viewport={"width": 1280, "height": 1800}, user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
                 page = context.new_page()
-                page.goto(
-                    "https://www.forexfactory.com/calendar",
-                    timeout=30_000,
-                )
+                page.goto("https://www.forexfactory.com/calendar", timeout=30_000)
                 page.wait_for_selector(".calendar__table", timeout=15_000)
-
-                # Hide low-impact rows — keep Red + Orange only
                 page.evaluate("""
                     document.querySelectorAll('.calendar__row').forEach(row => {
                         const imp = row.querySelector('.calendar__impact span');
                         if (imp) {
                             const cls = imp.className;
-                            if (!cls.includes('high') && !cls.includes('medium')) {
-                                row.style.display = 'none';
-                            }
+                            if (!cls.includes('high') && !cls.includes('medium')) { row.style.display = 'none'; }
                         }
                     });
                 """)
-
-                # Full-height screenshot of the calendar table
                 table = page.query_selector(".calendar__table")
-                if table:
-                    screenshot_bytes = table.screenshot(type="png")
-                else:
-                    screenshot_bytes = page.screenshot(full_page=True, type="png")
-
+                screenshot_bytes = table.screenshot(type="png") if table else page.screenshot(full_page=True, type="png")
                 browser.close()
                 log.info(f"Week screenshot: {len(screenshot_bytes):,} bytes")
                 return screenshot_bytes
@@ -632,22 +614,17 @@ class ChannelScraper:
 
     # ── Event Extraction ───────────────────────────────────────────────────────
     def _extract_events_from_page(self, page) -> List[dict]:
-        """Extract Red + Orange impact events from a ForexFactory calendar page."""
         events = []
         current_date = ""
-
         try:
             rows = page.query_selector_all(".calendar__row--event")
             for row in rows:
                 try:
-                    # Date cell (only on first event of each day)
                     date_cell = row.query_selector(".calendar__cell.calendar__date")
                     if date_cell:
                         date_text = date_cell.inner_text().strip()
                         if date_text:
                             current_date = date_text
-
-                    # Impact level
                     impact_el = row.query_selector(".calendar__impact span")
                     if not impact_el:
                         continue
@@ -657,51 +634,28 @@ class ChannelScraper:
                     elif "medium" in impact_class:
                         impact = "orange"
                     else:
-                        continue  # Skip low-impact
-
-                    # Time
+                        continue
                     time_el = row.query_selector(".calendar__cell.calendar__time")
                     time_raw = time_el.inner_text().strip() if time_el else ""
-
-                    # Currency
                     currency_el = row.query_selector(".calendar__cell.calendar__currency")
                     currency = currency_el.inner_text().strip() if currency_el else "—"
-
-                    # Event name
                     event_el = row.query_selector(".calendar__cell.calendar__event")
                     event_name = event_el.inner_text().strip() if event_el else "Unknown"
-
-                    # Forecast + Previous
                     forecast_el = row.query_selector(".calendar__cell.calendar__forecast")
                     forecast = (forecast_el.inner_text().strip() if forecast_el else "") or "—"
-
                     previous_el = row.query_selector(".calendar__cell.calendar__previous")
                     previous = (previous_el.inner_text().strip() if previous_el else "") or "—"
-
                     time_12h, time_24h = self._parse_ff_time(time_raw)
-
-                    events.append({
-                        "date": current_date,
-                        "time_raw": time_raw,
-                        "time_12h": time_12h,
-                        "time_24h": time_24h,
-                        "currency": currency,
-                        "name": event_name,
-                        "impact": impact,
-                        "forecast": forecast,
-                        "previous": previous,
-                    })
+                    events.append({"date": current_date, "time_raw": time_raw, "time_12h": time_12h, "time_24h": time_24h, "currency": currency, "name": event_name, "impact": impact, "forecast": forecast, "previous": previous})
                 except Exception as exc:
                     log.debug(f"Row parse error: {exc}")
                     continue
         except Exception as exc:
             log.error(f"Event extraction error: {exc}", exc_info=True)
-
         return events
 
     @staticmethod
     def _parse_ff_time(time_str: str) -> Tuple[str, str]:
-        """Convert ForexFactory time string (e.g. '8:30am') to 12h and 24h formats."""
         if not time_str or time_str in ("All Day", "Tentative", ""):
             return ("All Day", "")
         try:
@@ -715,28 +669,19 @@ class ChannelScraper:
             except ValueError:
                 return (time_str, "")
 
-    # ── Telegram Channel Scraping (News Moderation Flow) ──────────────────────
+    # ── Telegram Channel Scraping ──────────────────────────────────────────────
     async def _process_channel(self, channel: str):
         if not await self._ensure_connected():
             log.warning(f"Skipping {channel} — not connected.")
             return
-
         last_id = await self._mem.get_last_msg_id(channel)
         cutoff = None
         if last_id == 0:
             cutoff = datetime.now(timezone.utc) - timedelta(hours=self._lookback_hours)
-
         new_last_id = last_id
         collected = []
-
         try:
-            async for msg in self._client.iter_messages(
-                channel,
-                limit=50,
-                min_id=last_id if last_id else 0,
-                offset_date=cutoff,
-                reverse=True,
-            ):
+            async for msg in self._client.iter_messages(channel, limit=50, min_id=last_id if last_id else 0, offset_date=cutoff, reverse=True):
                 if msg.id <= last_id:
                     continue
                 if not (msg.text or msg.media):
@@ -747,18 +692,14 @@ class ChannelScraper:
             log.error(f"iter_messages error on {channel}: {exc}", exc_info=True)
             await self._ensure_connected()
             return
-
         if not collected:
             log.debug(f"No new messages from {channel}")
             await self._mem.set_last_msg_id(channel, new_last_id)
             return
-
         log.info(f"📨  {len(collected)} new message(s) from {channel}")
-
         for msg in collected:
             await self._handle_message(msg, channel)
             await asyncio.sleep(random.uniform(2, 6))
-
         await self._mem.set_last_msg_id(channel, new_last_id)
 
     # ── Per-message handler ────────────────────────────────────────────────────
@@ -766,7 +707,6 @@ class ChannelScraper:
         text = msg.text or msg.message or ""
         image_data: Optional[bytes] = None
         image_mime = "image/jpeg"
-
         if msg.media and _is_image(msg):
             try:
                 buf = io.BytesIO()
@@ -776,51 +716,26 @@ class ChannelScraper:
                 log.debug(f"Image: {len(image_data):,} bytes | mime={image_mime}")
             except Exception as exc:
                 log.warning(f"Image download failed: {exc}")
-
         content_hash = self._mem.hash_combined(text, image_data)
         if await self._mem.is_duplicate(content_hash):
             log.info(f"[SKIP] Duplicate — hash={content_hash[:12]}…")
             return
-
-        log.info(
-            f"🔍  Analysing msg {msg.id} from {source_channel} | "
-            f"text={len(text)}c | image={'✅' if image_data else '❌'}"
-        )
+        log.info(f"🔍  Analysing msg {msg.id} from {source_channel} | text={len(text)}c | image={'✅' if image_data else '❌'}")
         verdict = await self._ai.analyse(text, image_data, image_mime)
         await self._mem.mark_seen(content_hash, source=source_channel)
-
         if not verdict.get("approved"):
-            log.info(
-                f"[REJECTED] engine={verdict.get('engine')} | "
-                f"reason='{verdict.get('reason')}' | "
-                f"issues={verdict.get('issues')}"
-            )
+            log.info(f"[REJECTED] engine={verdict.get('engine')} | reason='{verdict.get('reason')}' | issues={verdict.get('issues')}")
             return
-
         post_text = self._build_post(verdict)
         delay = random.uniform(self._min_delay, self._max_delay)
         log.info(f"⏳  Waiting {delay:.1f}s before posting …")
         await asyncio.sleep(delay)
-
         await self._simulate_typing(len(post_text))
-
-        sent = await self._send(post_text, image_data, image_mime)
+        sent = await self._broadcast_media(post_text, image_data, image_mime)
         if sent is None:
             return
-
-        await self._mem.log_posted(
-            source_channel=source_channel,
-            source_msg_id=msg.id,
-            dest_msg_id=sent.id,
-            content_hash=content_hash,
-            ai_verdict=verdict,
-            formatted_text=post_text,
-        )
-        log.info(
-            f"✅  Posted → msg_id={sent.id} | "
-            f"engine={verdict.get('engine')} | "
-            f"confidence={verdict.get('confidence')}"
-        )
+        await self._mem.log_posted(source_channel=source_channel, source_msg_id=msg.id, dest_msg_id=sent.id, content_hash=content_hash, ai_verdict=verdict, formatted_text=post_text)
+        log.info(f"✅  Posted → msg_id={sent.id} | engine={verdict.get('engine')} | confidence={verdict.get('confidence')}")
 
     # ── Helpers ────────────────────────────────────────────────────────────────
     @staticmethod
@@ -833,85 +748,26 @@ class ChannelScraper:
 
     async def _simulate_typing(self, text_len: int):
         duration = min(max(text_len / 180, 2), 14)
-        try:
-            async with self._client.action(self._dest, "typing"):
-                await asyncio.sleep(duration)
-        except Exception as exc:
-            log.debug(f"Typing action skipped: {exc}")
+        # Type in first destination channel only (cosmetic)
+        if self._dest_channels:
+            try:
+                async with self._client.action(self._dest_channels[0], "typing"):
+                    await asyncio.sleep(duration)
+            except Exception as exc:
+                log.debug(f"Typing action skipped: {exc}")
 
+    # ── Legacy single-channel wrappers (kept for backward compat) ─────────────
     async def _send_text(self, text: str):
-        """Send plain text to destination channel."""
-        try:
-            return await self._client.send_message(
-                self._dest, text, parse_mode="md"
-            )
-        except ChatWriteForbiddenError:
-            log.error("❌  Cannot post — check admin rights.")
-        except FloodWaitError as fwe:
-            log.warning(f"FloodWait {fwe.seconds}s — retrying …")
-            await asyncio.sleep(fwe.seconds + 3)
-            return await self._send_text(text)
-        except Exception as exc:
-            log.error(f"Send text error: {exc}", exc_info=True)
-        return None
+        return await self._broadcast_text(text)
 
-    async def _send_file_with_caption(
-        self, file_bytes: bytes, mime: str, caption: str
-    ):
-        """
-        Send a screenshot as an inline PHOTO with caption.
-        buf.seek(0) is critical — without it Telethon reads from end of buffer (empty).
-        force_document=False ensures Telegram renders it as a photo, not a file attachment.
-        Falls back to text-only if send fails.
-        """
-        try:
-            ext = mimetypes.guess_extension(mime) or ".png"
-            buf = io.BytesIO(file_bytes)
-            buf.name = f"calendar{ext}"
-            buf.seek(0)
-            return await self._client.send_file(
-                self._dest,
-                buf,
-                caption=caption,
-                parse_mode="md",
-                force_document=False,
-            )
-        except Exception as exc:
-            log.error(f"Send screenshot error: {exc}", exc_info=True)
-            log.info("Falling back to text-only.")
-            return await self._send_text(caption)
+    async def _send_file_with_caption(self, file_bytes: bytes, mime: str, caption: str):
+        return await self._broadcast_file_with_caption(file_bytes, mime, caption)
 
     async def _send(self, text: str, image_data: Optional[bytes], image_mime: str):
-        """Send news post — with image if available, text-only otherwise."""
-        try:
-            if image_data:
-                buf = io.BytesIO(image_data)
-                ext = mimetypes.guess_extension(image_mime) or ".jpg"
-                buf.name = f"media{ext}"
-                buf.seek(0)
-                return await self._client.send_file(
-                    self._dest, buf, caption=text, parse_mode="md"
-                )
-            else:
-                return await self._client.send_message(
-                    self._dest, text, parse_mode="md"
-                )
-        except ChatWriteForbiddenError:
-            log.error("❌  Cannot post — check admin rights.")
-        except FloodWaitError as fwe:
-            log.warning(f"FloodWait {fwe.seconds}s — retrying …")
-            await asyncio.sleep(fwe.seconds + 3)
-            return await self._send(text, image_data, image_mime)
-        except Exception as exc:
-            log.error(f"Send error: {exc}", exc_info=True)
-        return None
+        return await self._broadcast_media(text, image_data, image_mime)
 
-    # ── Reminder Dispatcher (called from main.py reminder loop) ───────────────
+    # ── Reminder dispatcher loop ───────────────────────────────────────────────
     async def reminder_dispatcher_loop(self):
-        """
-        Dedicated reminder loop — checks every 60 seconds.
-        Runs concurrently with the main poll loop via asyncio.gather in main.py.
-        """
         log.info("🔔  Reminder dispatcher loop running …")
         while True:
             try:
