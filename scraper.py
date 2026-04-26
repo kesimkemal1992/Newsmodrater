@@ -26,8 +26,8 @@ EAT = pytz.timezone("Africa/Addis_Ababa")
 _IMG_MIMES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
 
 # ─── CONFIGURATION ──────────────────────────────────────────────────────────
-WEEKLY_OUTLOOK_HOUR = 22        # 10 PM EAT (በ22፡46 ለመሞከር ከፈለጉ ቀጥሎ ያለውን መስመር ያንቁ)
-WEEKLY_OUTLOOK_MINUTE = 18    # (ለሙከራ) ይህን አስተያየት አውጥተው ከላይ ያለውን ሰዓት 22 አድርገው ይጠቀሙ
+WEEKLY_OUTLOOK_HOUR = 23        # 10 PM EAT (በ22፡46 ለመሞከር ከፈለጉ ቀጥሎ ያለውን መስመር ያንቁ)
+WEEKLY_OUTLOOK_MINUTE = 29    # (ለሙከራ) ይህን አስተያየት አውጥተው ከላይ ያለውን ሰዓት 22 አድርገው ይጠቀሙ
 
 PLAYWRIGHT_TIMEOUT_MS = 60000   # 60 seconds
 PLAYWRIGHT_EXTRA_WAIT_MS = 5000 # 5 seconds
