@@ -1,6 +1,6 @@
 """
-scraper.py — Telethon scraper with real ForexFactory data + screenshots
-TEST_MODE=true forces immediate weekly outlook posting.
+scraper.py — Telethon scraper with real ForexFactory data + screenshot
+Only posts if screenshot is successfully captured.
 """
 
 import asyncio
@@ -32,12 +32,10 @@ _IMG_MIMES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
 # ─── CONFIGURATION ──────────────────────────────────────────────────────────
 WEEKLY_OUTLOOK_HOUR = 22
 WEEKLY_OUTLOOK_MINUTE = 10
-PLAYWRIGHT_TIMEOUT_MS = 90000
-PLAYWRIGHT_EXTRA_WAIT_MS = 8000
 
 TEST_MODE = os.getenv("TEST_MODE", "false").lower() == "true"
 if TEST_MODE:
-    log.warning("🧪 TEST_MODE enabled – weekly outlook will run NOW")
+    log.warning("🧪 TEST_MODE enabled – weekly outlook will run NOW (real post if screenshot works)")
 
 # ─── Helper functions ───────────────────────────────────────────────────────
 def _is_image(msg) -> bool:
@@ -64,7 +62,7 @@ def _clean_caption(text: str) -> str:
         return ""
     return text.replace("EAT", "").replace("E.A.T", "").strip()[:1024]
 
-# ─── Priority keywords and reminder logic (unchanged) ───────────────────────
+# ─── Priority keywords and reminder logic ───────────────────────────────────
 _PRIORITY_KEYWORDS = [
     "fomc", "federal open market committee", "interest rate decision",
     "nfp", "non-farm payroll", "cpi", "consumer price index",
@@ -113,7 +111,7 @@ class ChannelScraper:
                 self._dest_channels = [single]
         if not self._dest_channels:
             raise ValueError("No destination channels configured.")
-        log.info(f"📤 Post to {len(self._dest_channels)} channels | test_mode={self._test_mode}")
+        log.info(f"📤 Post to {len(self._dest_channels)} channel(s) | test_mode={self._test_mode}")
 
         self._sources = config["source_channels"]
         self._min_delay = config["min_delay_seconds"]
@@ -192,82 +190,87 @@ class ChannelScraper:
             await asyncio.sleep(1)
         return sent
 
-    async def _broadcast_media(self, text: str, img: Optional[bytes], mime: str):
-        sent = None
-        safe = _clean_caption(text)
-        for dest in self._dest_channels:
-            try:
-                if img:
-                    ext = mimetypes.guess_extension(mime) or ".jpg"
-                    buf = io.BytesIO(img)
-                    buf.name = f"media{ext}"
-                    buf.seek(0)
-                    sent = await self._client.send_file(dest, buf, caption=safe, parse_mode="md")
-                else:
-                    sent = await self._client.send_message(dest, safe, parse_mode="md")
-                log.info(f"  → Post to {dest} | id={sent.id}")
-            except FloodWaitError as fw:
-                await asyncio.sleep(fw.seconds + 3)
-                sent = await self._client.send_message(dest, safe, parse_mode="md")
-            except Exception as e:
-                log.error(f"Send error {dest}: {e}")
-            await asyncio.sleep(1)
-        return sent
-
-    # ─── Core: weekly outlook with real data ────────────────────────────────
+    # ─── Data fetching (real XML) ───────────────────────────────────────────
     async def _scrape_forex_factory_week(self) -> List[dict]:
-        """Real XML data (no hardcoded fallback)"""
         try:
             loop = asyncio.get_event_loop()
             events = await loop.run_in_executor(None, lambda: fetch_and_filter_events("USD", "High"))
             if events:
-                log.info(f"✅ Real XML events: {len(events)} USD High")
+                log.info(f"✅ Real XML: {len(events)} USD High events")
                 return events
             else:
-                log.warning("No events from XML")
+                log.warning("XML returned no events")
                 return []
         except Exception as e:
             log.error(f"XML fetch failed: {e}")
             return []
 
-    async def _take_forex_factory_screenshot_week(self) -> Optional[bytes]:
-        try:
-            from playwright.async_api import async_playwright
-            proxy_url = random.choice(STATIC_PROXIES) if STATIC_PROXIES else None
-            proxy_config = {"server": proxy_url} if proxy_url else None
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"], proxy=proxy_config)
-                ctx = await browser.new_context(locale="en-US", timezone_id="Africa/Addis_Ababa", viewport={"width": 1280, "height": 1800})
-                page = await ctx.new_page()
-                await page.goto("https://www.forexfactory.com/calendar", timeout=30000)
-                await page.wait_for_selector(".calendar__table", timeout=PLAYWRIGHT_TIMEOUT_MS)
-                await page.wait_for_timeout(PLAYWRIGHT_EXTRA_WAIT_MS)
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await page.wait_for_timeout(3000)
-                await page.evaluate("""
-                    document.querySelectorAll('.calendar__row--event').forEach(row => {
-                        const curr = row.querySelector('.calendar__currency');
-                        const imp = row.querySelector('.calendar__impact span');
-                        let hide = false;
-                        if (curr && curr.innerText.trim().toUpperCase() !== 'USD') hide = true;
-                        if (imp) {
-                            const cls = imp.className;
-                            const txt = imp.innerText.trim().toLowerCase();
-                            if (!cls.includes('high') && !cls.includes('impact--high') && txt !== 'high') hide = true;
-                        } else hide = true;
-                        if (hide) row.style.display = 'none';
-                    });
-                    document.querySelectorAll('.calendar__row--day-breaker').forEach(r => r.style.display = 'none');
-                """)
-                table = await page.query_selector(".calendar__table")
-                screenshot = await table.screenshot(type="png") if table else await page.screenshot(full_page=True, type="png")
-                await browser.close()
-                log.info(f"📸 Screenshot: {len(screenshot)} bytes")
-                return screenshot
-        except Exception as e:
-            log.error(f"Screenshot failed: {e}")
-            return None
+    # ─── Screenshot with retry (returns None if fails) ──────────────────────
+    async def _take_forex_factory_screenshot_week(self, retries: int = 3) -> Optional[bytes]:
+        """Take screenshot with retry logic. Returns None if all retries fail."""
+        from playwright.async_api import async_playwright
+        
+        # Disable proxy for reliability; change to a proxy if needed
+        proxy_url = None   # or random.choice(STATIC_PROXIES)
+        proxy_config = {"server": proxy_url} if proxy_url else None
+        
+        for attempt in range(retries):
+            try:
+                async with async_playwright() as p:
+                    browser = await p.chromium.launch(
+                        headless=True,
+                        args=["--no-sandbox", "--disable-setuid-sandbox"],
+                        proxy=proxy_config
+                    )
+                    context = await browser.new_context(
+                        locale="en-US",
+                        timezone_id="Africa/Addis_Ababa",
+                        viewport={"width": 1280, "height": 1800}
+                    )
+                    page = await context.new_page()
+                    
+                    await page.goto("https://www.forexfactory.com/calendar", timeout=60000)
+                    try:
+                        await page.wait_for_selector(".calendar__row", timeout=30000)
+                    except:
+                        await page.wait_for_timeout(5000)
+                    
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    await page.wait_for_timeout(3000)
+                    
+                    # Apply USD + High filter
+                    await page.evaluate("""
+                        document.querySelectorAll('.calendar__row--event').forEach(row => {
+                            const currEl = row.querySelector('.calendar__currency');
+                            const impEl = row.querySelector('.calendar__impact span');
+                            let hide = false;
+                            if (currEl && currEl.innerText.trim().toUpperCase() !== 'USD') hide = true;
+                            if (impEl) {
+                                const cls = impEl.className;
+                                const txt = impEl.innerText.trim().toLowerCase();
+                                if (!cls.includes('high') && !cls.includes('impact--high') && txt !== 'high') hide = true;
+                            } else hide = true;
+                            if (hide) row.style.display = 'none';
+                        });
+                        document.querySelectorAll('.calendar__row--day-breaker').forEach(r => r.style.display = 'none');
+                    """)
+                    
+                    table = await page.query_selector(".calendar__table")
+                    if table:
+                        screenshot = await table.screenshot(type="png")
+                    else:
+                        screenshot = await page.screenshot(full_page=True, type="png")
+                    
+                    await browser.close()
+                    log.info(f"Screenshot captured (attempt {attempt+1}): {len(screenshot)} bytes")
+                    return screenshot
+            except Exception as e:
+                log.warning(f"Screenshot attempt {attempt+1} failed: {e}")
+                await asyncio.sleep(3)
+        log.error("All screenshot attempts failed")
+        return None
 
+    # ─── Weekly outlook: only post if screenshot succeeds ───────────────────
     async def _check_weekly_outlook(self):
         now = _eat_now()
         if not self._test_mode:
@@ -283,7 +286,7 @@ class ChannelScraper:
 
         events = await self._scrape_forex_factory_week()
         if not events:
-            log.error("No events from real source → aborting post")
+            log.error("No events from real source → aborting")
             return
 
         week_start = now + timedelta(days=1)
@@ -293,15 +296,17 @@ class ChannelScraper:
         if not caption:
             caption = self._fallback_weekly(events, week_range)
 
-        screenshot = await self._take_forex_factory_screenshot_week()
-        if screenshot:
-            sent = await self._broadcast_file_with_caption(screenshot, "image/png", caption)
-        else:
-            sent = await self._broadcast_text(caption)
+        screenshot = await self._take_forex_factory_screenshot_week(retries=3)
+        if not screenshot:
+            log.error("Screenshot failed after retries → no post will be sent")
+            return
 
+        sent = await self._broadcast_file_with_caption(screenshot, "image/png", caption)
         if sent:
             self._weekly_posted_date = week_key
-            log.info(f"Weekly outlook posted, id={sent.id}")
+            log.info(f"Weekly outlook posted with screenshot, msg_id={sent.id}")
+        else:
+            log.error("Failed to send post")
 
     @staticmethod
     def _fallback_weekly(events: list, week_range: str) -> str:
@@ -325,7 +330,7 @@ class ChannelScraper:
         lines.append("\n📌 NOTE:\nMonitor all USD Red events closely. Manage risk carefully.")
         return "\n".join(lines)
 
-    # ─── Daily briefing (unchanged from your original) ──────────────────────
+    # ─── Daily briefing (same logic – only post if screenshot works) ────────
     async def _check_daily_briefing(self):
         now = _eat_now()
         today = _eat_today_str()
@@ -341,14 +346,14 @@ class ChannelScraper:
         self._todays_events = events
         self._todays_vip_events = self._select_vip_events(events)
         date_display = now.strftime("%A, %B %d, %Y")
-        brief = await self._ai.generate_daily_briefing(events, date_display)
-        if not brief:
+        caption = await self._ai.generate_daily_briefing(events, date_display)
+        if not caption:
             return
         screenshot = await self._take_forex_factory_screenshot_today()
-        if screenshot:
-            sent = await self._broadcast_file_with_caption(screenshot, "image/png", brief)
-        else:
-            sent = await self._broadcast_text(brief)
+        if not screenshot:
+            log.error("Daily briefing screenshot failed – no post")
+            return
+        sent = await self._broadcast_file_with_caption(screenshot, "image/png", caption)
         if sent:
             await self._mem.save_daily_briefing(today, sent.id, events)
 
@@ -358,27 +363,28 @@ class ChannelScraper:
         return [e for e in all_week if e.get("date") == today_str]
 
     async def _take_forex_factory_screenshot_today(self) -> Optional[bytes]:
+        from playwright.async_api import async_playwright
+        proxy_url = None
+        proxy_config = {"server": proxy_url} if proxy_url else None
         try:
-            from playwright.async_api import async_playwright
-            proxy_url = random.choice(STATIC_PROXIES) if STATIC_PROXIES else None
-            proxy_config = {"server": proxy_url} if proxy_url else None
             async with async_playwright() as p:
                 browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"], proxy=proxy_config)
-                ctx = await browser.new_context(locale="en-US", timezone_id="Africa/Addis_Ababa", viewport={"width": 1280, "height": 1000})
-                page = await ctx.new_page()
-                await page.goto("https://www.forexfactory.com/calendar?day=today", timeout=30000)
-                await page.wait_for_selector(".calendar__table", timeout=PLAYWRIGHT_TIMEOUT_MS)
-                await page.wait_for_timeout(PLAYWRIGHT_EXTRA_WAIT_MS)
-                # Apply filter (USD + High)
+                context = await browser.new_context(locale="en-US", timezone_id="Africa/Addis_Ababa", viewport={"width": 1280, "height": 1000})
+                page = await context.new_page()
+                await page.goto("https://www.forexfactory.com/calendar?day=today", timeout=60000)
+                await page.wait_for_load_state("networkidle", timeout=60000)
+                await page.wait_for_selector(".calendar__row", timeout=30000)
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await page.wait_for_timeout(2000)
                 await page.evaluate("""
                     document.querySelectorAll('.calendar__row--event').forEach(row => {
-                        const curr = row.querySelector('.calendar__currency');
-                        const imp = row.querySelector('.calendar__impact span');
+                        const currEl = row.querySelector('.calendar__currency');
+                        const impEl = row.querySelector('.calendar__impact span');
                         let hide = false;
-                        if (curr && curr.innerText.trim().toUpperCase() !== 'USD') hide = true;
-                        if (imp) {
-                            const cls = imp.className;
-                            const txt = imp.innerText.trim().toLowerCase();
+                        if (currEl && currEl.innerText.trim().toUpperCase() !== 'USD') hide = true;
+                        if (impEl) {
+                            const cls = impEl.className;
+                            const txt = impEl.innerText.trim().toLowerCase();
                             if (!cls.includes('high') && !cls.includes('impact--high') && txt !== 'high') hide = true;
                         } else hide = true;
                         if (hide) row.style.display = 'none';
@@ -386,11 +392,14 @@ class ChannelScraper:
                     document.querySelectorAll('.calendar__row--day-breaker').forEach(r => r.style.display = 'none');
                 """)
                 table = await page.query_selector(".calendar__table")
-                screenshot = await table.screenshot(type="png") if table else await page.screenshot(clip={"x":0,"y":0,"width":1280,"height":1000}, type="png")
+                if table:
+                    screenshot = await table.screenshot(type="png")
+                else:
+                    screenshot = await page.screenshot(full_page=True, type="png")
                 await browser.close()
                 return screenshot
         except Exception as e:
-            log.error(f"Today screenshot failed: {e}")
+            log.error(f"Daily screenshot failed: {e}")
             return None
 
     # ─── VIP selection (unchanged) ─────────────────────────────────────────
@@ -464,14 +473,14 @@ class ChannelScraper:
         for dest in self._dest_channels:
             try:
                 sent = await self._client.send_message(dest, safe, parse_mode="md", reply_to=reply_id)
-                log.info(f"Reminder sent to {dest} id={sent.id}")
+                log.info(f"Reminder to {dest} id={sent.id}")
             except Exception as e:
                 log.error(f"Reminder fail {dest}: {e}")
             await asyncio.sleep(1)
         await self._mem.mark_reminder_sent(key)
         await self._mem.increment_reminder_count(today)
 
-    # ─── Channel scraping (unchanged from your original) ────────────────────
+    # ─── Channel processing (unchanged) ─────────────────────────────────────
     async def poll_and_forward(self):
         stats = await self._mem.stats()
         log.info(f"Poll cycle | sources={len(self._sources)} | hashes={stats['tracked_hashes']} | posted_24h={stats['posted_last_24h']}")
@@ -560,6 +569,29 @@ class ChannelScraper:
         if sent:
             await self._mem.log_posted(src, msg.id, sent.id, chash, verdict, post)
             log.info(f"✅ Posted id={sent.id} engine={verdict.get('engine')}")
+
+    async def _broadcast_media(self, text: str, img: Optional[bytes], mime: str):
+        """Legacy method – kept for channel forwarding (text with optional image)"""
+        sent = None
+        safe = _clean_caption(text)
+        for dest in self._dest_channels:
+            try:
+                if img:
+                    ext = mimetypes.guess_extension(mime) or ".jpg"
+                    buf = io.BytesIO(img)
+                    buf.name = f"media{ext}"
+                    buf.seek(0)
+                    sent = await self._client.send_file(dest, buf, caption=safe, parse_mode="md")
+                else:
+                    sent = await self._client.send_message(dest, safe, parse_mode="md")
+                log.info(f"  → Post to {dest} | id={sent.id}")
+            except FloodWaitError as fw:
+                await asyncio.sleep(fw.seconds + 3)
+                sent = await self._client.send_message(dest, safe, parse_mode="md")
+            except Exception as e:
+                log.error(f"Send error {dest}: {e}")
+            await asyncio.sleep(1)
+        return sent
 
     @staticmethod
     def _build_post(v: dict) -> str:
