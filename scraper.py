@@ -3,17 +3,15 @@ scraper.py — Telethon channel scraper, forwarder, and Forex Factory scheduler.
 
 Features:
   • Scrapes Telegram channels and forwards approved news (moderation flow)
-  • Scrapes ForexFactory.com via Playwright (Red + Orange events only)
-  • Posts Daily Briefing at 07:00 AM EAT as PHOTO + caption (today screenshot)
-  • Posts 10-min alerts as REPLIES to the morning briefing (max 2/day)
-    — Look-Ahead Priority Strategy: reserves slots for Top 2 VIP events of the day
-    — FOMC, NFP, CPI, Rate Decisions, Fed Chair always take the 2 slots
-    — Lower-priority events are SKIPPED if a VIP event comes later that day
-  • Posts Weekly Outlook every Sunday at 09:00 PM EAT as PHOTO + caption
+  • Scrapes ForexFactory.com via Async Playwright (Red + Orange USD events only for screenshots)
+  • Posts Daily Briefing at 07:00 AM as PHOTO + caption (today screenshot)
+  • Posts 10-min alerts as REPLIES to the morning briefing
+    — Look-Ahead Priority Strategy: 1 Main Event per day + 1 Optional Night Event (>= 18:00)
+  • Posts Weekly Outlook every Sunday at 09:00 PM as PHOTO + caption
+  • Double-verification duplicate block for both text and images
+  • Adds 'Squad 4xx' randomly to posts as a Markdown hyperlink
   • Auto-reconnect on Telethon ConnectionError
-  • Posts to MULTIPLE destination channels (DEST_CHANNELS env var, comma-separated)
-
-Timezone: Africa/Addis_Ababa (GMT+3) — EAT.
+  • Posts to MULTIPLE destination channels
 """
 
 import asyncio
@@ -180,8 +178,6 @@ class ChannelScraper:
         self._mem = memory
 
         # ── Multi-destination channel support ──────────────────────────────────
-        # DEST_CHANNELS (comma-separated) takes priority over DEST_CHANNEL.
-        # Both are parsed in main.py and stored as a list in config["dest_channels"].
         self._dest_channels: List[str] = config.get("dest_channels", [])
         if not self._dest_channels:
             # Fallback: single channel from legacy key
@@ -386,36 +382,45 @@ class ChannelScraper:
         else:
             log.error("Failed to send daily briefing.")
 
-    # ── Look-Ahead VIP Selection ───────────────────────────────────────────────
+    # ── Look-Ahead VIP Selection (Day & Night Smart Priority) ──────────────────
     def _select_vip_events(self, events: List[dict]) -> List[dict]:
         """
-        Filter and rank today's events for reminder slots.
-
-        Hard rules (ALL must pass via _is_reminder_eligible):
-          • Currency = USD  OR  event name contains Gold / XAU
-          • Impact   = Red only (Orange never alerted)
-          • Forecast AND Previous must both be real values (not dash)
-
-        Within passing events, Tier 1 keywords (NFP, CPI, FOMC, etc.)
-        rank first so they always claim the Top 2 slots.
+        Smart Day/Night Priority Filter:
+        Tier 0 (Super VIP): Powell, FOMC, Rate Decision
+        Tier 1 (VIP): CPI, NFP, GDP, Retail Sales etc.
+        Tier 2 (Normal): All other Red USD events.
         """
         eligible = [e for e in events if _is_reminder_eligible(e)]
 
         if not eligible:
-            log.info("No reminder-eligible events today (need USD/Gold, Red, Forecast+Previous).")
+            log.info("No reminder-eligible events today.")
             return []
 
-        def sort_key(event):
-            is_priority = _is_priority_event(event.get("name", ""))
-            time_str = event.get("time_24h", "99:99")
-            return (0 if is_priority else 1, time_str)
+        def get_score(event):
+            name = event.get("name", "").lower()
+            if "powell" in name or "fomc" in name or "rate decision" in name:
+                return 0
+            if any(k in name for k in _PRIORITY_KEYWORDS):
+                return 1
+            return 2
 
-        sorted_events = sorted(eligible, key=sort_key)
-        vip = sorted_events[:2]
+        day_events = [e for e in eligible if e.get("time_24h", "99:99") < "18:00"]
+        night_events = [e for e in eligible if e.get("time_24h", "99:99") >= "18:00"]
+
+        vip = []
+        
+        if day_events:
+            day_events.sort(key=lambda e: (get_score(e), e.get("time_24h", "99:99")))
+            vip.append(day_events[0])
+
+        if night_events:
+            night_events.sort(key=lambda e: (get_score(e), e.get("time_24h", "99:99")))
+            vip.append(night_events[0])
+            
+        vip.sort(key=lambda e: e.get("time_24h", "99:99"))
 
         log.info(
-            f"Look-Ahead: {len(eligible)} eligible event(s) (USD/Gold + Red + Forecast+Prev). "
-            f"Top 2 VIP slots: {[e.get('name') for e in vip]}"
+            f"VIP slots reserved for {len(vip)} event(s): {[e.get('name') for e in vip]}"
         )
         return vip
 
@@ -532,7 +537,7 @@ class ChannelScraper:
     async def _take_forex_factory_screenshot_week(self) -> Optional[bytes]:
         return await self._playwright_screenshot_week()
 
-    # ── Playwright: Today Scrape ───────────────────────────────────────────────
+    # ── Playwright: Today Scrape (Async) ───────────────────────────────────────
     async def _playwright_scrape_today(self) -> List[dict]:
         try:
             from playwright.async_api import async_playwright
@@ -550,7 +555,7 @@ class ChannelScraper:
             log.error(f"Playwright today scrape failed: {exc}", exc_info=True)
             return []
 
-    # ── Playwright: Week Scrape ────────────────────────────────────────────────
+    # ── Playwright: Week Scrape (Async) ────────────────────────────────────────
     async def _playwright_scrape_week(self) -> List[dict]:
         try:
             from playwright.async_api import async_playwright
@@ -568,7 +573,7 @@ class ChannelScraper:
             log.error(f"Playwright week scrape failed: {exc}", exc_info=True)
             return []
 
-    # ── Playwright: Today Screenshot (USD ONLY) ────────────────────────────────
+    # ── Playwright: Today Screenshot (Async & USD ONLY) ────────────────────────
     async def _playwright_screenshot_today(self) -> Optional[bytes]:
         try:
             from playwright.async_api import async_playwright
@@ -603,7 +608,7 @@ class ChannelScraper:
             log.error(f"Playwright today screenshot failed: {exc}", exc_info=True)
             return None
 
-    # ── Playwright: Week Screenshot (USD ONLY) ─────────────────────────────────
+    # ── Playwright: Week Screenshot (Async & USD ONLY) ─────────────────────────
     async def _playwright_screenshot_week(self) -> Optional[bytes]:
         try:
             from playwright.async_api import async_playwright
@@ -727,7 +732,7 @@ class ChannelScraper:
             await asyncio.sleep(random.uniform(2, 6))
         await self._mem.set_last_msg_id(channel, new_last_id)
 
-    # ── Per-message handler (Double Duplicate Check Added) ─────────────────────
+    # ── Strict Double Verification Duplicate Check ────────────────────────────
     async def _handle_message(self, msg, source_channel: str):
         text = msg.text or msg.message or ""
         image_data: Optional[bytes] = None
@@ -798,6 +803,13 @@ class ChannelScraper:
         tags = verdict.get("hashtags", "").strip()
         if tags and not body.endswith(tags):
             body = f"{body}\n\n{tags}"
+            
+        # ── Random Channel Username Feature with Markdown Hyperlink ──
+        # በ 30% ዕድል "Squad 4xx" የሚለውን ፅሁፍ ከፖስቱ መጨረሻ ላይ ይጨምራል (Hyperlink ተደርጎ)
+        # YourChannelUsername የሚለውን በቻናልህ ትክክለኛ ዩዘርኔም ወይም ሊንክ ቀይረው (ለምሳሌ: https://t.me/Squad4xx)
+        if random.random() < 0.30:
+            body += "\n\n💡 [Squad 4xx](@Squad_4xx)"
+            
         return body
 
     async def _simulate_typing(self, text_len: int):
@@ -829,3 +841,4 @@ class ChannelScraper:
             except Exception as exc:
                 log.error(f"Reminder dispatcher error: {exc}", exc_info=True)
             await asyncio.sleep(60)
+
