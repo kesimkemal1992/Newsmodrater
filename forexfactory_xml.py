@@ -6,85 +6,140 @@ import xml.etree.ElementTree as ET
 import requests
 from typing import List, Dict, Optional
 from datetime import datetime
+from requests.exceptions import ProxyError, Timeout, ConnectionError
 
 XML_FEED_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
 
-# Free proxy API endpoints (multiple fallbacks)
-PROXY_APIS = [
-    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000&country=all&ssl=all&anonymity=all",
-    "https://www.proxy-list.download/api/v1/get?type=http",
-    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+# የተሰጡት ሶክስ5 ፕሮክሲዎች (ከዚህ በታች ሙሉ ዝርዝር)
+STATIC_PROXIES = [
+    "socks5://72.49.49.11:31034",
+    "socks5://208.102.51.6:58208",
+    "socks5://69.61.200.104:36181",
+    "socks5://66.42.224.229:41679",
+    "socks5://192.111.137.37:18762",
+    "socks5://192.252.208.67:14287",
+    "socks5://192.252.208.70:14282",
+    "socks5://192.111.135.18:18301",
+    "socks5://192.111.129.145:16894",
+    "socks5://192.252.214.20:15864",
+    "socks5://174.77.111.198:49547",
+    "socks5://98.178.72.21:10919",
+    "socks5://184.178.172.28:15294",
+    "socks5://184.178.172.25:15291",
+    "socks5://184.178.172.18:15280",
+    "socks5://184.178.172.5:15303",
+    "socks5://70.166.167.38:57728",
+    "socks5://184.178.172.13:15311",
+    "socks5://192.252.215.5:16137",
+    "socks5://72.205.0.93:4145",
+    "socks5://162.253.68.97:4145",
+    "socks5://134.199.159.23:1080",
+    "socks5://103.174.122.197:8199",
+    "socks5://121.169.46.116:1090",
+    "socks5://184.95.220.42:1080",
+    "socks5://5.255.117.127:1080",
+    "socks5://5.255.113.177:1080",
+    "socks5://203.189.135.73:1080",
+    "socks5://5.255.99.75:1080",
+    "socks5://206.123.156.217:5836",
+    "socks5://206.123.156.213:6410",
+    "socks5://206.123.156.217:6198",
+    "socks5://206.123.156.215:18136",
+    "socks5://206.123.156.213:6264",
+    "socks5://206.123.156.213:25003",
+    "socks5://109.201.65.228:1080",
+    "socks5://195.19.50.44:1080",
+    "socks5://195.19.50.57:1080",
+    "socks5://206.123.156.213:6357",
+    "socks5://206.123.156.213:6383",
+    "socks5://206.123.156.213:6343",
+    "socks5://206.123.156.211:4553",
+    "socks5://206.123.156.211:5875",
+    "socks5://206.123.156.215:4240",
+    "socks5://212.58.132.5:1080",
+    "socks5://206.123.156.217:6182",
+    "socks5://206.123.156.201:4136",
+    "socks5://93.177.116.84:1080",
+    "socks5://206.123.156.207:8315",
+    "socks5://129.150.55.165:1080",
+    "socks5://206.123.156.215:5144",
+    "socks5://206.123.156.213:4048",
+    "socks5://151.241.109.212:1080",
+    "socks5://206.123.156.215:7036",
+    "socks5://206.123.156.217:6425",
+    "socks5://206.123.156.217:7045",
+    "socks5://206.123.156.215:7063",
+    "socks5://206.123.156.215:5299",
+    "socks5://206.123.156.215:6497",
+    "socks5://206.123.156.215:7180",
+    "socks5://206.123.156.215:5534",
+    "socks5://206.123.156.207:5470",
+    "socks5://77.239.112.110:1080",
+    "socks5://206.123.156.236:5550",
+    "socks5://206.123.156.217:7648",
+    "socks5://206.123.156.217:5825",
+    "socks5://206.123.156.213:6167",
+    "socks5://206.123.156.211:7702",
+    "socks5://206.123.156.231:7389",
+    "socks5://206.123.156.231:4409",
+    "socks5://206.123.156.213:6461",
+    "socks5://206.123.156.213:24668",
+    "socks5://206.123.156.217:5215",
+    "socks5://206.123.156.215:4717",
+    "socks5://206.123.156.231:5725",
+    "socks5://206.123.156.215:7280",
+    "socks5://206.123.156.215:5263",
+    "socks5://206.123.156.215:6601",
+    "socks5://206.123.156.231:5841",
+    "socks5://206.123.156.215:7293",
+    "socks5://206.123.156.213:4761",
+    "socks5://206.123.156.231:5750",
+    "socks5://206.123.156.231:4699",
+    "socks5://206.123.156.215:6018",
+    "socks5://206.123.156.215:4274",
+    "socks5://206.123.156.231:5938",
+    "socks5://206.123.156.231:5632",
+    "socks5://206.123.156.231:8431",
+    "socks5://206.123.156.231:7651",
+    "socks5://206.123.156.231:6076",
+    "socks5://206.123.156.215:4586",
+    "socks5://206.123.156.207:9126",
+    "socks5://206.123.156.231:6954",
+    "socks5://206.123.156.207:6772",
+    "socks5://5.255.103.55:1080",
+    "socks5://206.123.156.217:23032",
+    "socks5://206.123.156.217:22993",
+    "socks5://206.123.156.217:22879",
+    "socks5://206.123.156.217:22781",
+    "socks5://206.123.156.217:22604",
 ]
 
-_proxy_cache = []
-_last_proxy_fetch = 0
+# ከአካባቢ ተለዋዋጭ ወይም ከላይ ካለው ዝርዝር ፕሮክሲ አምጣ
+def _get_proxy_list() -> List[str]:
+    env_proxies = os.getenv("PROXY_LIST")
+    if env_proxies:
+        return [p.strip() for p in env_proxies.split(",") if p.strip()]
+    return STATIC_PROXIES.copy()
 
-def _fetch_free_proxies() -> List[str]:
-    """Fetch a list of free HTTP proxies from multiple sources."""
-    global _proxy_cache, _last_proxy_fetch
-    now = time.time()
-    # Refresh cache every 15 minutes (free proxies die fast)
-    if _proxy_cache and (now - _last_proxy_fetch) < 900:
-        return _proxy_cache
-    
-    proxies = []
-    for api_url in PROXY_APIS:
-        try:
-            resp = requests.get(api_url, timeout=10)
-            if resp.status_code == 200:
-                if "json" in api_url:
-                    # JSON response handling (for proxy-list.download)
-                    data = resp.json()
-                    if isinstance(data, list):
-                        proxies = data
-                        break
-                else:
-                    # Plain text list
-                    raw_proxies = [p.strip() for p in resp.text.split('\n') if p.strip() and ':' in p]
-                    if raw_proxies:
-                        proxies = raw_proxies
-                        break
-        except Exception as e:
-            print(f"Proxy fetch failed from {api_url}: {e}")
-            continue
-    
-    if proxies:
-        _proxy_cache = proxies
-        _last_proxy_fetch = now
-        print(f"✅ Fetched {len(proxies)} free proxies")
-        # Keep only first 100 to avoid huge lists
-        if len(_proxy_cache) > 100:
-            _proxy_cache = _proxy_cache[:100]
-    else:
-        print("⚠️ No free proxies fetched, will retry direct connection")
-    
-    return _proxy_cache
+_proxy_cache = _get_proxy_list()
+_last_proxy_index = 0
 
 def _get_random_proxy() -> Optional[Dict[str, str]]:
-    """Returns a random proxy dict or None."""
-    proxies = _fetch_free_proxies()
-    if not proxies:
+    """Return a random SOCKS5 proxy dict for requests."""
+    if not _proxy_cache:
         return None
-    # Test proxy before using? (too slow, skip)
-    proxy = random.choice(proxies)
-    # Ensure format: IP:PORT
-    if not proxy.startswith("http://"):
-        proxy_url = f"http://{proxy}"
-    else:
-        proxy_url = proxy
-    return {"http": proxy_url, "https": proxy_url}
+    proxy_url = random.choice(_proxy_cache)
+    return {
+        "http": proxy_url,
+        "https": proxy_url,
+    }
 
 def fetch_xml_with_retry(timeout: int = 25, retries: int = 5, backoff: int = 5) -> Optional[ET.Element]:
     """
-    Fetch XML with retry logic and fallback to free proxies.
-    Strategy:
-      1. Try direct connection (fastest)
-      2. If rate limited, retry with exponential backoff
-      3. After 3 failures, try with random free proxy
-      4. Finally, return None
+    Fetch XML using direct first, then fallback to rotating SOCKS5 proxies.
     """
-    # First, try direct (no proxy)
-    for attempt in range(retries):
+    # First attempt: direct (no proxy) – fastest
+    for attempt in range(2):
         try:
             response = requests.get(
                 XML_FEED_URL,
@@ -95,31 +150,29 @@ def fetch_xml_with_retry(timeout: int = 25, retries: int = 5, backoff: int = 5) 
                 return ET.fromstring(response.content)
             elif response.status_code == 429:
                 wait = backoff * (attempt + 1)
-                print(f"⚠️ Rate limited (429) - direct attempt {attempt+1}/{retries}, waiting {wait}s...")
+                print(f"Rate limited (429) direct – waiting {wait}s")
                 time.sleep(wait)
             else:
-                print(f"HTTP {response.status_code} - retrying...")
+                print(f"HTTP {response.status_code}, retrying...")
                 time.sleep(backoff)
-        except requests.exceptions.Timeout:
-            print(f"Timeout on attempt {attempt+1}")
+        except (Timeout, ConnectionError) as e:
+            print(f"Direct attempt {attempt+1} failed: {e}")
             time.sleep(backoff)
-        except requests.exceptions.RequestException as e:
-            print(f"Request error (attempt {attempt+1}): {e}")
+        except Exception as e:
+            print(f"Unexpected error: {e}")
             time.sleep(backoff)
-        except ET.ParseError as e:
-            print(f"XML parse error: {e}")
-            return None
 
-    # If direct fails, try with free proxies
-    print("🔄 Direct connection failed, trying with free proxy...")
-    for proxy_attempt in range(3):  # try up to 3 different proxies
+    # Now try with rotating SOCKS5 proxies (up to 20 attempts)
+    for proxy_attempt in range(20):
         proxy = _get_random_proxy()
         if not proxy:
-            print("No free proxy available, aborting")
+            print("No proxy available, aborting")
             break
         try:
-            proxy_url = proxy.get("http", "")
-            print(f"🔄 Trying proxy: {proxy_url.split('@')[-1] if '@' in proxy_url else proxy_url}")
+            proxy_url = proxy["http"]
+            # Mask password if present
+            display_proxy = proxy_url.split('@')[-1] if '@' in proxy_url else proxy_url
+            print(f"🔄 Trying proxy {proxy_attempt+1}: {display_proxy}")
             response = requests.get(
                 XML_FEED_URL,
                 timeout=timeout + 5,
@@ -127,14 +180,14 @@ def fetch_xml_with_retry(timeout: int = 25, retries: int = 5, backoff: int = 5) 
                 headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
             )
             if response.status_code == 200:
-                print("✅ XML fetched successfully via proxy")
+                print(f"✅ XML fetched via proxy {display_proxy}")
                 return ET.fromstring(response.content)
             else:
-                print(f"Proxy returned status {response.status_code}")
-        except Exception as e:
-            print(f"Proxy attempt {proxy_attempt+1} failed: {e}")
-        time.sleep(2)
-    
+                print(f"Proxy returned {response.status_code}, skipping")
+        except (ProxyError, Timeout, ConnectionError) as e:
+            print(f"Proxy {proxy_attempt+1} error: {e}")
+        time.sleep(1)
+
     print("❌ All fetch methods failed.")
     return None
 
