@@ -1,5 +1,5 @@
 """
-scraper.py — Telethon scraper with real ForexFactory data + Cloudflare bypass
+scraper.py — Telethon scraper with real ForexFactory data + Cloudflare bypass (no external stealth)
 Only posts if screenshot is successfully captured.
 """
 
@@ -24,8 +24,6 @@ from ai_engine import AIEngine
 from memory import MemoryManager
 from forexfactory_xml import fetch_and_filter_events, STATIC_PROXIES
 
-# For Cloudflare bypass
-from playwright_stealth import stealth_async
 from playwright.async_api import async_playwright
 
 log = logging.getLogger("scraper")
@@ -209,7 +207,7 @@ class ChannelScraper:
             log.error(f"XML fetch failed: {e}")
             return []
 
-    # ─── Screenshot with Cloudflare bypass (stealth) and retries ────────────
+    # ─── Screenshot with anti‑detection (no external stealth) ───────────────
     async def _take_forex_factory_screenshot_week(self, retries: int = 3) -> Optional[bytes]:
         user_agents = [
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -235,17 +233,14 @@ class ChannelScraper:
                         extra_http_headers={"Accept-Language": "en-US,en;q=0.9"}
                     )
                     page = await context.new_page()
-                    await stealth_async(page)  # <-- Cloudflare bypass
                     
                     await page.goto("https://www.forexfactory.com/calendar", timeout=60000)
                     await page.wait_for_timeout(5000)
                     
-                    # If Cloudflare challenge appears, wait longer
                     if "verification" in (await page.title()).lower():
                         log.warning("Cloudflare challenge detected, waiting 15 seconds...")
                         await page.wait_for_timeout(15000)
                     
-                    # Wait for actual table
                     await page.wait_for_selector(".calendar__row", timeout=45000)
                     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                     await page.wait_for_timeout(3000)
@@ -279,7 +274,7 @@ class ChannelScraper:
             except Exception as e:
                 log.warning(f"Screenshot attempt {attempt+1} failed: {e}")
                 await asyncio.sleep(5)
-        log.error("All screenshot attempts failed (Cloudflare likely blocking)")
+        log.error("All screenshot attempts failed")
         return None
 
     # ─── Weekly outlook: only post if screenshot succeeds ───────────────────
@@ -342,7 +337,7 @@ class ChannelScraper:
         lines.append("\n📌 NOTE:\nMonitor all USD Red events closely. Manage risk carefully.")
         return "\n".join(lines)
 
-    # ─── Daily briefing (same logic – only post if screenshot works) ────────
+    # ─── Daily briefing (same logic) ────────────────────────────────────────
     async def _check_daily_briefing(self):
         now = _eat_now()
         today = _eat_today_str()
@@ -388,10 +383,11 @@ class ChannelScraper:
                     locale="en-US",
                     timezone_id="Africa/Addis_Ababa",
                     viewport={"width": 1280, "height": 1000},
-                    user_agent=random.choice(user_agents)
+                    user_agent=random.choice(user_agents),
+                    extra_http_headers={"Accept-Language": "en-US,en;q=0.9"}
                 )
                 page = await context.new_page()
-                await stealth_async(page)
+                
                 await page.goto("https://www.forexfactory.com/calendar?day=today", timeout=60000)
                 await page.wait_for_timeout(5000)
                 if "verification" in (await page.title()).lower():
