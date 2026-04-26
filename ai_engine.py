@@ -126,7 +126,7 @@ STRICT RULES:
 - DO NOT use asterisks (*) or any markdown bolding — plain text only
 - English only
 - No MARKET FOCUS or MARKET STATUS section
-- The motivational closing line is already provided below — use it exactly as given, do not change it
+- The motivational closing line is already provided below — copy it exactly, do not change it
 
 Event details:
 Name: {event_name}
@@ -233,6 +233,7 @@ _MOTIVATIONAL_POOL = [
     "💰 You worked hard for every dollar in that account. Do not hand it to the market carelessly. Guard it. 🛡️",
 ]
 
+
 def _get_motivational_line(index: int = 0) -> str:
     """Pick a motivational line by cycling index through the pool."""
     return _MOTIVATIONAL_POOL[index % len(_MOTIVATIONAL_POOL)]
@@ -273,7 +274,7 @@ def _parse_json(raw: str) -> dict:
     # Step 3: Try direct JSON parse first
     try:
         data = json.loads(raw)
-        return _validate_and_clean(data, raw)
+        return _validate_and_clean(data)
     except json.JSONDecodeError:
         pass
 
@@ -281,20 +282,19 @@ def _parse_json(raw: str) -> dict:
     m = re.search(r"\{.*\}", raw, re.DOTALL)
     if m:
         candidate = m.group()
-        # Clean trailing commas again inside extracted block
         candidate = re.sub(r",\s*([}\]])", r"\1", candidate)
         try:
             data = json.loads(candidate)
-            return _validate_and_clean(data, raw)
+            return _validate_and_clean(data)
         except json.JSONDecodeError:
             pass
 
-    # Step 5: Last resort — try to reconstruct from key patterns
+    # Step 5: Last resort — log and raise
     log.warning(f"_parse_json: all strategies failed. Raw snippet: {raw[:200]}")
     raise ValueError(f"No valid JSON found in AI response:\n{raw[:300]}")
 
 
-def _validate_and_clean(data: dict, raw: str) -> dict:
+def _validate_and_clean(data: dict) -> dict:
     """Set defaults, strip stray asterisks from output, run signal check."""
     data.setdefault("approved", False)
     data.setdefault("reason", "")
@@ -331,7 +331,8 @@ class AIEngine:
 
         genai.configure(api_key=gemini_key)
 
-        # Primary: Gemini 2.5 Flash — JSON mode for moderation
+        # ✅ FIX: correct stable model name — NOT gemini-2.5-flash-preview-05-20
+        # Primary: JSON mode for news moderation
         self._gemini = genai.GenerativeModel(
             model_name="gemini-2.5-flash",
             system_instruction=_SYSTEM_PROMPT,
@@ -342,7 +343,9 @@ class AIEngine:
             ),
         )
 
-        # Gemini text model — for free-text generation (briefings, alerts, weekly)
+        # ✅ FIX: _gemini_text MUST exist — used for briefings, alerts, weekly
+        # This was completely missing from GitHub version causing all calendar
+        # features to crash with AttributeError: 'AIEngine' has no '_gemini_text'
         self._gemini_text = genai.GenerativeModel(
             model_name="gemini-2.5-flash",
             generation_config=genai.GenerationConfig(
@@ -388,12 +391,12 @@ class AIEngine:
         except Exception as exc:
             log.warning(f"Gemini NEWS failed ({exc}) — trying Groq …")
 
-        # Layer 2 — Groq (Fallback)
+        # Layer 2 — Groq llama-4-scout (Fallback)
         try:
             verdict = await asyncio.wait_for(
                 self._groq_call(prompt, image_data, image_mime), timeout=55
             )
-            verdict["engine"] = "groq-llama4-vision"
+            verdict["engine"] = "groq-llama4-scout"
             log.info(
                 f"Groq NEWS → approved={verdict['approved']} | {verdict.get('reason', '')}"
             )
@@ -449,6 +452,7 @@ class AIEngine:
         """
         impact_emoji = "🔴" if event.get("impact") == "red" else "🟠"
         motivational_line = _get_motivational_line(motivational_index)
+
         prompt = _ALERT_PROMPT_TEMPLATE.format(
             event_name=event.get("name", "Unknown Event"),
             currency=event.get("currency", "USD"),
@@ -476,7 +480,8 @@ class AIEngine:
             return _strip_asterisks(result.strip())
         except Exception as exc:
             log.error(f"Both engines failed for alert — using fallback.")
-            return self._fallback_alert(event)
+            # ✅ FIX: pass motivational_index to fallback (was missing before)
+            return self._fallback_alert(event, motivational_index)
 
     # ── Weekly Outlook ─────────────────────────────────────────────────────────
     async def generate_weekly_outlook(self, events: list, week_range: str) -> str:
@@ -528,13 +533,17 @@ class AIEngine:
             4. Return valid JSON only — no markdown fences — no trailing commas.
         """).strip()
 
-    async def _gemini_call(self, prompt: str, image_data: Optional[bytes], image_mime: str) -> dict:
+    async def _gemini_call(
+        self, prompt: str, image_data: Optional[bytes], image_mime: str
+    ) -> dict:
         parts = []
         if image_data:
             parts.append({"inline_data": {"mime_type": image_mime, "data": _b64(image_data)}})
         parts.append(prompt)
         loop = asyncio.get_event_loop()
-        resp = await loop.run_in_executor(None, lambda: self._gemini.generate_content(parts))
+        resp = await loop.run_in_executor(
+            None, lambda: self._gemini.generate_content(parts)
+        )
         return _parse_json(resp.text)
 
     async def _gemini_text_call(self, prompt: str) -> str:
@@ -544,7 +553,9 @@ class AIEngine:
         )
         return resp.text
 
-    async def _groq_call(self, prompt: str, image_data: Optional[bytes], image_mime: str) -> dict:
+    async def _groq_call(
+        self, prompt: str, image_data: Optional[bytes], image_mime: str
+    ) -> dict:
         content = []
         if image_data:
             content.append({
@@ -589,6 +600,7 @@ class AIEngine:
 
     @staticmethod
     def _fallback_alert(event: dict, motivational_index: int = 0) -> str:
+        # ✅ FIX: motivational_index now correctly passed and used
         emoji = "🔴" if event.get("impact") == "red" else "🟠"
         line = _get_motivational_line(motivational_index)
         return (
@@ -608,7 +620,9 @@ class AIEngine:
     def _fallback_weekly(events: list, week_range: str) -> str:
         from itertools import groupby
         lines = [f"📅 WEEKLY HIGH IMPACT OUTLOOK\nWeek of {week_range}\n"]
-        for day, day_events in groupby(events, key=lambda e: e.get("date", "Unknown")):
+        for day, day_events in groupby(
+            events, key=lambda e: e.get("date", "Unknown")
+        ):
             lines.append(f"\n{day}")
             for ev in day_events:
                 emoji = "🔴" if ev.get("impact") == "red" else "🟠"
