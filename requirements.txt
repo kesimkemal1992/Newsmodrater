@@ -9,4 +9,3 @@ playwright==1.44.0
 pytz==2024.1
 requests==2.31.0
 PySocks==1.7.1
-playwright-stealth
