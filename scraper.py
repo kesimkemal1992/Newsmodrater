@@ -1,5 +1,7 @@
 """
 scraper.py — Telethon scraper with Forex Factory XML data + Playwright screenshots
+Production mode: TEST_MODE=False (default) sends real posts.
+Set environment variable TEST_MODE=true to simulate without sending.
 """
 
 import asyncio
@@ -7,6 +9,7 @@ import io
 import json
 import logging
 import mimetypes
+import os
 import random
 from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Tuple
@@ -19,7 +22,7 @@ from telethon.errors import FloodWaitError, ChatWriteForbiddenError
 
 from ai_engine import AIEngine
 from memory import MemoryManager
-from forexfactory_xml import fetch_and_filter_events   # new XML module
+from forexfactory_xml import fetch_and_filter_events
 
 log = logging.getLogger("scraper")
 
@@ -27,13 +30,18 @@ EAT = pytz.timezone("Africa/Addis_Ababa")
 _IMG_MIMES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
 
 # ─── CONFIGURATION ──────────────────────────────────────────────────────────
-WEEKLY_OUTLOOK_HOUR = 0        # 10:00 PM EAT (Sunday)
-WEEKLY_OUTLOOK_MINUTE = 6      # 10 minutes past the hour (i.e., 22:10)
+WEEKLY_OUTLOOK_HOUR = 22        # 10:00 PM EAT (Sunday)
+WEEKLY_OUTLOOK_MINUTE = 10      # 10 minutes past the hour
 
 PLAYWRIGHT_TIMEOUT_MS = 60000   # 60 seconds
 PLAYWRIGHT_EXTRA_WAIT_MS = 5000 # 5 seconds
 
-# ─── Helper functions (unchanged from original) ─────────────────────────────
+# Test mode from environment (default False = real posting)
+TEST_MODE = os.getenv("TEST_MODE", "false").lower() == "true"
+if TEST_MODE:
+    log.warning("🧪 TEST_MODE is ENABLED — no real posts will be sent.")
+
+# ─── Helper functions ───────────────────────────────────────────────────────
 def _is_image(msg) -> bool:
     if isinstance(msg.media, MessageMediaPhoto):
         return True
@@ -58,7 +66,7 @@ def _clean_caption(text: str) -> str:
         return ""
     return text.replace("EAT", "").replace("E.A.T", "").strip()[:1024]
 
-# ─── Priority keywords for reminders (unchanged) ────────────────────────────
+# ─── Priority keywords for reminders ────────────────────────────────────────
 _PRIORITY_KEYWORDS = [
     "fomc", "federal open market committee", "interest rate decision",
     "nfp", "non-farm payroll", "cpi", "consumer price index",
@@ -92,12 +100,13 @@ def _is_reminder_eligible(event: dict) -> bool:
 def _is_priority_event(event_name: str) -> bool:
     return any(kw in event_name.lower() for kw in _PRIORITY_KEYWORDS)
 
-# ─── ChannelScraper class (with XML integration) ────────────────────────────
+# ─── ChannelScraper class ───────────────────────────────────────────────────
 class ChannelScraper:
     def __init__(self, config: dict, ai_engine: AIEngine, memory: MemoryManager):
         self._cfg = config
         self._ai = ai_engine
         self._mem = memory
+        self._test_mode = TEST_MODE  # from environment
 
         self._dest_channels = config.get("dest_channels", [])
         if not self._dest_channels:
@@ -106,7 +115,7 @@ class ChannelScraper:
                 self._dest_channels = [single]
         if not self._dest_channels:
             raise ValueError("No destination channels configured.")
-        log.info(f"📤 Posting to {len(self._dest_channels)} channel(s)")
+        log.info(f"📤 Posting to {len(self._dest_channels)} channel(s) | test_mode={self._test_mode}")
 
         self._sources = config["source_channels"]
         self._min_delay = config["min_delay_seconds"]
@@ -154,8 +163,12 @@ class ChannelScraper:
                 return False
         return True
 
-    # ─── Broadcast helpers (multi‑channel) ───────────────────────────────────
+    # ─── Broadcast helpers with test mode support ────────────────────────────
     async def _broadcast_text(self, text: str):
+        if self._test_mode:
+            log.info(f"🧪 TEST MODE: Would send text to {self._dest_channels}:\n{text[:500]}...")
+            return None
+
         sent = None
         safe = _clean_caption(text)
         for dest in self._dest_channels:
@@ -171,6 +184,10 @@ class ChannelScraper:
         return sent
 
     async def _broadcast_file_with_caption(self, data: bytes, mime: str, caption: str):
+        if self._test_mode:
+            log.info(f"🧪 TEST MODE: Would send screenshot ({len(data)} bytes) with caption:\n{caption[:500]}...")
+            return None
+
         sent = None
         safe_cap = _clean_caption(caption)
         for dest in self._dest_channels:
@@ -188,6 +205,10 @@ class ChannelScraper:
         return sent
 
     async def _broadcast_media(self, text: str, img: Optional[bytes], mime: str):
+        if self._test_mode:
+            log.info(f"🧪 TEST MODE: Would send media: text_len={len(text)}, img_size={len(img) if img else 0}")
+            return None
+
         sent = None
         safe = _clean_caption(text)
         for dest in self._dest_channels:
@@ -255,7 +276,7 @@ class ChannelScraper:
             sent = await self._broadcast_file_with_caption(screenshot, "image/png", brief)
         else:
             sent = await self._broadcast_text(brief)
-        if sent:
+        if sent and not self._test_mode:
             await self._mem.save_daily_briefing(today, sent.id, events)
             log.info(f"📅 Briefing posted id={sent.id}")
 
@@ -281,7 +302,7 @@ class ChannelScraper:
         vip.sort(key=lambda e: e.get("time_24h"))
         return vip
 
-    # ─── Reminders (unchanged) ───────────────────────────────────────────────
+    # ─── Reminders ───────────────────────────────────────────────────────────
     async def _check_reminders(self):
         today = _eat_today_str()
         cnt = await self._mem.get_reminder_count_today(today)
@@ -328,6 +349,11 @@ class ChannelScraper:
             log.error("Alert generation failed")
             return
         safe = _clean_caption(alert)
+        if self._test_mode:
+            log.info(f"🧪 TEST MODE: Would send reminder to {self._dest_channels}:\n{safe[:300]}...")
+            await self._mem.mark_reminder_sent(key)
+            await self._mem.increment_reminder_count(today)
+            return
         for dest in self._dest_channels:
             try:
                 sent = await self._client.send_message(dest, safe, parse_mode="md", reply_to=reply_id)
@@ -338,18 +364,20 @@ class ChannelScraper:
         await self._mem.mark_reminder_sent(key)
         await self._mem.increment_reminder_count(today)
 
-    # ─── WEEKLY OUTLOOK (XML + screenshot with JS filter) ────────────────────
+    # ─── WEEKLY OUTLOOK (XML + screenshot) ───────────────────────────────────
     async def _check_weekly_outlook(self):
         now = _eat_now()
-        if now.weekday() != 6:   # Sunday
-            return
-        if now.hour != WEEKLY_OUTLOOK_HOUR:
-            return
-        if now.minute != WEEKLY_OUTLOOK_MINUTE:
-            return
+        if not self._test_mode:
+            if now.weekday() != 6:
+                return
+            if now.hour != WEEKLY_OUTLOOK_HOUR or now.minute != WEEKLY_OUTLOOK_MINUTE:
+                return
+        else:
+            log.info("🧪 TEST MODE: Weekly outlook will run now regardless of time.")
+            # optional: add a small delay to avoid loop? not needed.
 
         week_key = now.strftime("%Y-%W")
-        if self._weekly_posted_date == week_key:
+        if self._weekly_posted_date == week_key and not self._test_mode:
             return
 
         log.info("📆 Weekly outlook – fetching USD High events via XML")
@@ -371,16 +399,14 @@ class ChannelScraper:
         if screenshot:
             sent = await self._broadcast_file_with_caption(screenshot, "image/png", caption)
         else:
-            log.warning("Screenshot failed – sending text only")
             sent = await self._broadcast_text(caption)
 
-        if sent:
+        if sent and not self._test_mode:
             self._weekly_posted_date = week_key
             log.info(f"📆 Weekly outlook posted id={sent.id}")
 
     # ─── Data scraping: XML first, fallback to Playwright ────────────────────
     async def _scrape_forex_factory_week(self) -> List[dict]:
-        """Get USD High events from XML; fallback to Playwright scraping."""
         try:
             loop = asyncio.get_event_loop()
             xml_events = await loop.run_in_executor(
@@ -395,7 +421,6 @@ class ChannelScraper:
         return await self._playwright_scrape_week_fallback()
 
     async def _scrape_forex_factory_today(self) -> List[dict]:
-        """Same for today (uses same XML feed, but filter by date later if needed)."""
         try:
             loop = asyncio.get_event_loop()
             xml_events = await loop.run_in_executor(
@@ -403,7 +428,6 @@ class ChannelScraper:
                 lambda: fetch_and_filter_events(currency="USD", impact="High")
             )
             if xml_events:
-                # Optionally filter by today's date (the XML already gives current week)
                 log.info(f"Today XML: {len(xml_events)} USD High events found")
                 return xml_events
         except Exception as e:
@@ -411,7 +435,6 @@ class ChannelScraper:
         return await self._playwright_scrape_today_fallback()
 
     async def _playwright_scrape_week_fallback(self) -> List[dict]:
-        """Original Playwright scraping as fallback (kept for compatibility)."""
         try:
             from playwright.async_api import async_playwright
             async with async_playwright() as p:
@@ -439,7 +462,10 @@ class ChannelScraper:
         try:
             from playwright.async_api import async_playwright
             async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"])
+                browser = await p.chromium.launch(
+                    headless=True,
+                    args=["--no-sandbox", "--disable-setuid-sandbox"]
+                )
                 context = await browser.new_context(locale="en-US", timezone_id="Africa/Addis_Ababa")
                 page = await context.new_page()
                 await page.goto("https://www.forexfactory.com/calendar?day=today", timeout=30000)
@@ -472,10 +498,8 @@ class ChannelScraper:
                 await page.goto("https://www.forexfactory.com/calendar", timeout=30000)
                 await page.wait_for_selector(".calendar__table", timeout=30000)
                 await page.wait_for_timeout(5000)
-                # Scroll to load all rows
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 await page.wait_for_timeout(2000)
-                # Hide rows that are not USD and High impact
                 await page.evaluate("""
                     document.querySelectorAll('.calendar__row--event').forEach(row => {
                         const currEl = row.querySelector('.calendar__currency');
@@ -613,7 +637,6 @@ class ChannelScraper:
             except:
                 return (t, "")
 
-    # ─── Fallback for weekly outlook (if AI fails) ───────────────────────────
     @staticmethod
     def _fallback_weekly(events: list, week_range: str) -> str:
         from itertools import groupby
@@ -639,7 +662,7 @@ class ChannelScraper:
         lines.append("\n📌 NOTE:\nMonitor all USD Red events closely. Manage risk carefully around high-impact releases.")
         return "\n".join(lines)
 
-    # ─── Telegram channel processing (unchanged) ─────────────────────────────
+    # ─── Telegram channel processing ─────────────────────────────────────────
     async def _process_channel(self, channel: str):
         if not await self._ensure_connected():
             return
@@ -708,7 +731,7 @@ class ChannelScraper:
         await self._simulate_typing(len(post))
 
         sent = await self._broadcast_media(post, img, mime)
-        if sent:
+        if sent and not self._test_mode:
             await self._mem.log_posted(src, msg.id, sent.id, chash, verdict, post)
             log.info(f"✅ Posted id={sent.id} engine={verdict.get('engine')}")
 
