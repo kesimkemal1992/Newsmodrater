@@ -808,7 +808,7 @@ class ChannelScraper:
         # በ 30% ዕድል "Squad 4xx" የሚለውን ፅሁፍ ከፖስቱ መጨረሻ ላይ ይጨምራል (Hyperlink ተደርጎ)
         # YourChannelUsername የሚለውን በቻናልህ ትክክለኛ ዩዘርኔም ወይም ሊንክ ቀይረው (ለምሳሌ: https://t.me/Squad4xx)
         if random.random() < 0.30:
-            body += "\n\n💡 [Squad 4xx](@Squad_4xx)"
+            body += "\n\n💡 [Squad 4xx](https://t.me/Squad_4xx)"
             
         return body
 
