@@ -1,5 +1,5 @@
 """
-scraper.py — Telethon scraper with real ForexFactory data + screenshot
+scraper.py — Telethon scraper with real ForexFactory data + Cloudflare bypass
 Only posts if screenshot is successfully captured.
 """
 
@@ -24,12 +24,16 @@ from ai_engine import AIEngine
 from memory import MemoryManager
 from forexfactory_xml import fetch_and_filter_events, STATIC_PROXIES
 
+# For Cloudflare bypass
+from playwright_stealth import stealth_async
+from playwright.async_api import async_playwright
+
 log = logging.getLogger("scraper")
 
 EAT = pytz.timezone("Africa/Addis_Ababa")
 _IMG_MIMES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
 
-# ─── CONFIGURATION ──────────────────────────────────────────────────────────
+# ─── Configuration ──────────────────────────────────────────────────────────
 WEEKLY_OUTLOOK_HOUR = 22
 WEEKLY_OUTLOOK_MINUTE = 10
 
@@ -205,36 +209,44 @@ class ChannelScraper:
             log.error(f"XML fetch failed: {e}")
             return []
 
-    # ─── Screenshot with retry (returns None if fails) ──────────────────────
+    # ─── Screenshot with Cloudflare bypass (stealth) and retries ────────────
     async def _take_forex_factory_screenshot_week(self, retries: int = 3) -> Optional[bytes]:
-        """Take screenshot with retry logic. Returns None if all retries fail."""
-        from playwright.async_api import async_playwright
-        
-        # Disable proxy for reliability; change to a proxy if needed
-        proxy_url = None   # or random.choice(STATIC_PROXIES)
-        proxy_config = {"server": proxy_url} if proxy_url else None
-        
+        user_agents = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        ]
         for attempt in range(retries):
             try:
                 async with async_playwright() as p:
                     browser = await p.chromium.launch(
                         headless=True,
-                        args=["--no-sandbox", "--disable-setuid-sandbox"],
-                        proxy=proxy_config
+                        args=[
+                            "--no-sandbox",
+                            "--disable-setuid-sandbox",
+                            "--disable-blink-features=AutomationControlled"
+                        ]
                     )
                     context = await browser.new_context(
                         locale="en-US",
                         timezone_id="Africa/Addis_Ababa",
-                        viewport={"width": 1280, "height": 1800}
+                        viewport={"width": random.randint(1200, 1400), "height": 800},
+                        user_agent=random.choice(user_agents),
+                        extra_http_headers={"Accept-Language": "en-US,en;q=0.9"}
                     )
                     page = await context.new_page()
+                    await stealth_async(page)  # <-- Cloudflare bypass
                     
                     await page.goto("https://www.forexfactory.com/calendar", timeout=60000)
-                    try:
-                        await page.wait_for_selector(".calendar__row", timeout=30000)
-                    except:
-                        await page.wait_for_timeout(5000)
+                    await page.wait_for_timeout(5000)
                     
+                    # If Cloudflare challenge appears, wait longer
+                    if "verification" in (await page.title()).lower():
+                        log.warning("Cloudflare challenge detected, waiting 15 seconds...")
+                        await page.wait_for_timeout(15000)
+                    
+                    # Wait for actual table
+                    await page.wait_for_selector(".calendar__row", timeout=45000)
                     await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                     await page.wait_for_timeout(3000)
                     
@@ -266,8 +278,8 @@ class ChannelScraper:
                     return screenshot
             except Exception as e:
                 log.warning(f"Screenshot attempt {attempt+1} failed: {e}")
-                await asyncio.sleep(3)
-        log.error("All screenshot attempts failed")
+                await asyncio.sleep(5)
+        log.error("All screenshot attempts failed (Cloudflare likely blocking)")
         return None
 
     # ─── Weekly outlook: only post if screenshot succeeds ───────────────────
@@ -363,17 +375,28 @@ class ChannelScraper:
         return [e for e in all_week if e.get("date") == today_str]
 
     async def _take_forex_factory_screenshot_today(self) -> Optional[bytes]:
-        from playwright.async_api import async_playwright
-        proxy_url = None
-        proxy_config = {"server": proxy_url} if proxy_url else None
+        user_agents = [
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        ]
         try:
             async with async_playwright() as p:
-                browser = await p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-setuid-sandbox"], proxy=proxy_config)
-                context = await browser.new_context(locale="en-US", timezone_id="Africa/Addis_Ababa", viewport={"width": 1280, "height": 1000})
+                browser = await p.chromium.launch(
+                    headless=True,
+                    args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"]
+                )
+                context = await browser.new_context(
+                    locale="en-US",
+                    timezone_id="Africa/Addis_Ababa",
+                    viewport={"width": 1280, "height": 1000},
+                    user_agent=random.choice(user_agents)
+                )
                 page = await context.new_page()
+                await stealth_async(page)
                 await page.goto("https://www.forexfactory.com/calendar?day=today", timeout=60000)
-                await page.wait_for_load_state("networkidle", timeout=60000)
-                await page.wait_for_selector(".calendar__row", timeout=30000)
+                await page.wait_for_timeout(5000)
+                if "verification" in (await page.title()).lower():
+                    await page.wait_for_timeout(15000)
+                await page.wait_for_selector(".calendar__row", timeout=45000)
                 await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
                 await page.wait_for_timeout(2000)
                 await page.evaluate("""
