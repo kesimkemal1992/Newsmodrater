@@ -12,3 +12,5 @@ requests==2.31.0
 socks5
 requests[socks]
 httpx[socks]
+playwright-extra
+playwright-stealth
