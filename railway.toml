@@ -6,3 +6,5 @@ dockerfilePath = "Dockerfile"
 startCommand = "python main.py"
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 5
+[phases.setup]
+nixPkgs = ["chromium", "chromium-driver"]
