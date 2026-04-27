@@ -67,7 +67,7 @@ def _clean_caption(text: str) -> str:
         return ""
     return text.replace("EAT", "").replace("E.A.T", "").strip()[:1024]
 
-# ─── Priority keywords and reminder logic (unchanged) ──────────────────────
+# ─── Priority keywords and reminder logic ───────────────────────────────────
 _PRIORITY_KEYWORDS = [
     "fomc", "federal open market committee", "interest rate decision",
     "nfp", "non-farm payroll", "cpi", "consumer price index",
@@ -210,22 +210,23 @@ class ChannelScraper:
             log.error(f"XML fetch failed: {e}")
             return []
 
-    # ─── Screenshot via Browserless.io API (no Playwright) ──────────────────
+    # ─── Browserless screenshot (correct API payload) ───────────────────────
     async def _take_screenshot_via_browserless(self, url: str, wait_selector: str = ".calendar__row", full_page: bool = True) -> Optional[bytes]:
         if not BROWSERLESS_TOKEN:
             log.error("BROWSERLESS_TOKEN missing")
             return None
         api_url = f"https://chrome.browserless.io/screenshot?token={BROWSERLESS_TOKEN}"
+        
+        # Correct: no "options" wrapper
         payload = {
             "url": url,
-            "options": {
-                "viewport": {"width": 1280, "height": 1800},
-                "fullPage": full_page,
-                "waitForSelector": wait_selector,
-                "waitForTimeout": 15000,
-                "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            }
+            "viewport": {"width": 1280, "height": 1800},
+            "fullPage": full_page,
+            "waitForSelector": wait_selector,
+            "waitForTimeout": 15000,
+            "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         }
+        
         async with aiohttp.ClientSession() as session:
             try:
                 async with session.post(api_url, json=payload, timeout=aiohttp.ClientTimeout(total=60)) as resp:
@@ -254,6 +255,13 @@ class ChannelScraper:
             await asyncio.sleep(3)
         log.error("All screenshot attempts via Browserless failed")
         return None
+
+    async def _take_forex_factory_screenshot_today(self) -> Optional[bytes]:
+        return await self._take_screenshot_via_browserless(
+            "https://www.forexfactory.com/calendar?day=today",
+            wait_selector=".calendar__row",
+            full_page=False
+        )
 
     # ─── Weekly outlook: only post if screenshot succeeds ───────────────────
     async def _check_weekly_outlook(self):
@@ -347,13 +355,6 @@ class ChannelScraper:
         today_str = _eat_now().strftime("%Y-%m-%d")
         return [e for e in all_week if e.get("date") == today_str]
 
-    async def _take_forex_factory_screenshot_today(self) -> Optional[bytes]:
-        return await self._take_screenshot_via_browserless(
-            "https://www.forexfactory.com/calendar?day=today",
-            wait_selector=".calendar__row",
-            full_page=False
-        )
-
     # ─── VIP selection (unchanged) ─────────────────────────────────────────
     def _select_vip_events(self, events: List[dict]) -> List[dict]:
         eligible = [e for e in events if _is_reminder_eligible(e)]
@@ -432,7 +433,7 @@ class ChannelScraper:
         await self._mem.mark_reminder_sent(key)
         await self._mem.increment_reminder_count(today)
 
-    # ─── Channel processing (unchanged, but keep the methods) ───────────────
+    # ─── Channel processing (unchanged) ─────────────────────────────────────
     async def poll_and_forward(self):
         stats = await self._mem.stats()
         log.info(f"Poll cycle | sources={len(self._sources)} | hashes={stats['tracked_hashes']} | posted_24h={stats['posted_last_24h']}")
