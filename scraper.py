@@ -96,10 +96,18 @@ _HTTP_HEADERS = {
     "Accept": "application/json",
     "Accept-Language": "en-US,en;q=0.9",
 }
-_FF_JSON_THIS_WEEK = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-_FF_JSON_NEXT_WEEK = "https://nfs.faireconomy.media/ff_calendar_nextweek.json"
-_FF_URL_TODAY      = "https://www.forexfactory.com/calendar?day=today"
-_FF_URL_WEEK       = "https://www.forexfactory.com/calendar"
+# Primary + mirror sources — tried in order until one succeeds
+_FF_JSON_THIS_WEEK_SOURCES = [
+    "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
+    "https://cdn-nfs.faireconomy.media/ff_calendar_thisweek.json",
+    "https://raw.githubusercontent.com/mahalanobisforex/forex-factory-json/main/thisweek.json",
+]
+_FF_JSON_NEXT_WEEK_SOURCES = [
+    "https://nfs.faireconomy.media/ff_calendar_nextweek.json",
+    "https://cdn-nfs.faireconomy.media/ff_calendar_nextweek.json",
+]
+_FF_URL_TODAY = "https://www.forexfactory.com/calendar?day=today"
+_FF_URL_WEEK  = "https://www.forexfactory.com/calendar"
 
 # ── JS: filter table to USD Red only ──────────────────────────────────────────
 _JS_FILTER_USD_RED = """
@@ -235,18 +243,48 @@ def _phash_distance(h1: str, h2: str) -> int:
         return 999
 
 
-# ── FF JSON fetcher (no Cloudflare) ───────────────────────────────────────────
+# ── FF JSON fetcher — retry + mirror fallback ──────────────────────────────────
 
-def _fetch_ff_json(url: str) -> List[dict]:
-    try:
-        resp = requests.get(url, headers=_HTTP_HEADERS, timeout=20)
-        resp.raise_for_status()
-        raw = resp.json()
-        log.info(f"FF JSON: {len(raw)} events from {url}")
-        return _normalise_ff_json(raw)
-    except Exception as exc:
-        log.error(f"FF JSON fetch failed: {exc}")
-        return []
+import time as _time
+
+def _fetch_ff_json_url(url: str, retries: int = 3) -> Optional[list]:
+    """Fetch raw JSON from one URL with exponential backoff on 429/5xx."""
+    for attempt in range(1, retries + 1):
+        try:
+            if attempt > 1:
+                wait = (2 ** attempt) + random.uniform(0, 2)
+                log.info(f"Retry {attempt}/{retries} for {url} in {wait:.1f}s …")
+                _time.sleep(wait)
+
+            resp = requests.get(url, headers=_HTTP_HEADERS, timeout=25)
+
+            if resp.status_code == 429:
+                retry_after = int(resp.headers.get("Retry-After", 15))
+                log.warning(f"429 rate limit on {url} — waiting {retry_after}s …")
+                _time.sleep(retry_after + 2)
+                continue
+
+            resp.raise_for_status()
+            raw = resp.json()
+            log.info(f"FF JSON OK: {len(raw)} events from {url}")
+            return raw
+
+        except Exception as exc:
+            log.warning(f"Attempt {attempt} failed ({url}): {exc}")
+
+    return None
+
+
+def _fetch_ff_json(sources: List[str]) -> List[dict]:
+    """Try each mirror URL in order until one returns data."""
+    for url in sources:
+        log.info(f"Trying FF source: {url}")
+        raw = _fetch_ff_json_url(url)
+        if raw is not None:
+            return _normalise_ff_json(raw)
+        log.warning("Source failed — trying next mirror …")
+    log.error("All FF JSON sources failed.")
+    return []
 
 def _normalise_ff_json(raw: list) -> List[dict]:
     events = []
@@ -903,12 +941,12 @@ class ChannelScraper:
 
     async def _fetch_this_week(self) -> List[dict]:
         return await asyncio.get_event_loop().run_in_executor(
-            None, lambda: _fetch_ff_json(_FF_JSON_THIS_WEEK)
+            None, lambda: _fetch_ff_json(_FF_JSON_THIS_WEEK_SOURCES)
         )
 
     async def _fetch_next_week(self) -> List[dict]:
         return await asyncio.get_event_loop().run_in_executor(
-            None, lambda: _fetch_ff_json(_FF_JSON_NEXT_WEEK)
+            None, lambda: _fetch_ff_json(_FF_JSON_NEXT_WEEK_SOURCES)
         )
 
     # ── Telegram Channel Scraping ──────────────────────────────────────────────
