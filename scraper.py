@@ -1,5 +1,5 @@
 """
-scraper.py — Telethon scraper with real ForexFactory data + Cloudflare bypass (no external stealth)
+scraper.py — Telethon scraper with real ForexFactory data + Browserless.io screenshot API
 Only posts if screenshot is successfully captured.
 """
 
@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 from typing import Optional, List, Dict, Tuple
 
 import pytz
+import aiohttp
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
@@ -22,9 +23,7 @@ from telethon.errors import FloodWaitError, ChatWriteForbiddenError
 
 from ai_engine import AIEngine
 from memory import MemoryManager
-from forexfactory_xml import fetch_and_filter_events, STATIC_PROXIES
-
-from playwright.async_api import async_playwright
+from forexfactory_xml import fetch_and_filter_events
 
 log = logging.getLogger("scraper")
 
@@ -38,6 +37,10 @@ WEEKLY_OUTLOOK_MINUTE = 10
 TEST_MODE = os.getenv("TEST_MODE", "false").lower() == "true"
 if TEST_MODE:
     log.warning("🧪 TEST_MODE enabled – weekly outlook will run NOW (real post if screenshot works)")
+
+BROWSERLESS_TOKEN = os.getenv("BROWSERLESS_TOKEN")
+if not BROWSERLESS_TOKEN:
+    log.warning("⚠️ BROWSERLESS_TOKEN not set. Screenshots will fail.")
 
 # ─── Helper functions ───────────────────────────────────────────────────────
 def _is_image(msg) -> bool:
@@ -64,7 +67,7 @@ def _clean_caption(text: str) -> str:
         return ""
     return text.replace("EAT", "").replace("E.A.T", "").strip()[:1024]
 
-# ─── Priority keywords and reminder logic ───────────────────────────────────
+# ─── Priority keywords and reminder logic (unchanged) ──────────────────────
 _PRIORITY_KEYWORDS = [
     "fomc", "federal open market committee", "interest rate decision",
     "nfp", "non-farm payroll", "cpi", "consumer price index",
@@ -207,74 +210,49 @@ class ChannelScraper:
             log.error(f"XML fetch failed: {e}")
             return []
 
-    # ─── Screenshot with anti‑detection (no external stealth) ───────────────
-    async def _take_forex_factory_screenshot_week(self, retries: int = 3) -> Optional[bytes]:
-        user_agents = [
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        ]
-        for attempt in range(retries):
+    # ─── Screenshot via Browserless.io API (no Playwright) ──────────────────
+    async def _take_screenshot_via_browserless(self, url: str, wait_selector: str = ".calendar__row", full_page: bool = True) -> Optional[bytes]:
+        if not BROWSERLESS_TOKEN:
+            log.error("BROWSERLESS_TOKEN missing")
+            return None
+        api_url = f"https://chrome.browserless.io/screenshot?token={BROWSERLESS_TOKEN}"
+        payload = {
+            "url": url,
+            "options": {
+                "viewport": {"width": 1280, "height": 1800},
+                "fullPage": full_page,
+                "waitForSelector": wait_selector,
+                "waitForTimeout": 15000,
+                "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            }
+        }
+        async with aiohttp.ClientSession() as session:
             try:
-                async with async_playwright() as p:
-                    browser = await p.chromium.launch(
-                        headless=True,
-                        args=[
-                            "--no-sandbox",
-                            "--disable-setuid-sandbox",
-                            "--disable-blink-features=AutomationControlled"
-                        ]
-                    )
-                    context = await browser.new_context(
-                        locale="en-US",
-                        timezone_id="Africa/Addis_Ababa",
-                        viewport={"width": random.randint(1200, 1400), "height": 800},
-                        user_agent=random.choice(user_agents),
-                        extra_http_headers={"Accept-Language": "en-US,en;q=0.9"}
-                    )
-                    page = await context.new_page()
-                    
-                    await page.goto("https://www.forexfactory.com/calendar", timeout=60000)
-                    await page.wait_for_timeout(5000)
-                    
-                    if "verification" in (await page.title()).lower():
-                        log.warning("Cloudflare challenge detected, waiting 15 seconds...")
-                        await page.wait_for_timeout(15000)
-                    
-                    await page.wait_for_selector(".calendar__row", timeout=45000)
-                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    await page.wait_for_timeout(3000)
-                    
-                    # Apply USD + High filter
-                    await page.evaluate("""
-                        document.querySelectorAll('.calendar__row--event').forEach(row => {
-                            const currEl = row.querySelector('.calendar__currency');
-                            const impEl = row.querySelector('.calendar__impact span');
-                            let hide = false;
-                            if (currEl && currEl.innerText.trim().toUpperCase() !== 'USD') hide = true;
-                            if (impEl) {
-                                const cls = impEl.className;
-                                const txt = impEl.innerText.trim().toLowerCase();
-                                if (!cls.includes('high') && !cls.includes('impact--high') && txt !== 'high') hide = true;
-                            } else hide = true;
-                            if (hide) row.style.display = 'none';
-                        });
-                        document.querySelectorAll('.calendar__row--day-breaker').forEach(r => r.style.display = 'none');
-                    """)
-                    
-                    table = await page.query_selector(".calendar__table")
-                    if table:
-                        screenshot = await table.screenshot(type="png")
+                async with session.post(api_url, json=payload, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                    if resp.status == 200:
+                        screenshot = await resp.read()
+                        log.info(f"Screenshot via Browserless: {len(screenshot)} bytes")
+                        return screenshot
                     else:
-                        screenshot = await page.screenshot(full_page=True, type="png")
-                    
-                    await browser.close()
-                    log.info(f"Screenshot captured (attempt {attempt+1}): {len(screenshot)} bytes")
-                    return screenshot
+                        text = await resp.text()
+                        log.error(f"Browserless API error {resp.status}: {text[:200]}")
+                        return None
             except Exception as e:
-                log.warning(f"Screenshot attempt {attempt+1} failed: {e}")
-                await asyncio.sleep(5)
-        log.error("All screenshot attempts failed")
+                log.error(f"Browserless request failed: {e}")
+                return None
+
+    async def _take_forex_factory_screenshot_week(self, retries: int = 2) -> Optional[bytes]:
+        for attempt in range(retries):
+            log.info(f"Screenshot attempt {attempt+1}/{retries} via Browserless")
+            screenshot = await self._take_screenshot_via_browserless(
+                "https://www.forexfactory.com/calendar",
+                wait_selector=".calendar__row",
+                full_page=True
+            )
+            if screenshot:
+                return screenshot
+            await asyncio.sleep(3)
+        log.error("All screenshot attempts via Browserless failed")
         return None
 
     # ─── Weekly outlook: only post if screenshot succeeds ───────────────────
@@ -303,9 +281,9 @@ class ChannelScraper:
         if not caption:
             caption = self._fallback_weekly(events, week_range)
 
-        screenshot = await self._take_forex_factory_screenshot_week(retries=3)
+        screenshot = await self._take_forex_factory_screenshot_week(retries=2)
         if not screenshot:
-            log.error("Screenshot failed after retries → no post will be sent")
+            log.error("Screenshot failed → no post will be sent")
             return
 
         sent = await self._broadcast_file_with_caption(screenshot, "image/png", caption)
@@ -370,56 +348,11 @@ class ChannelScraper:
         return [e for e in all_week if e.get("date") == today_str]
 
     async def _take_forex_factory_screenshot_today(self) -> Optional[bytes]:
-        user_agents = [
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        ]
-        try:
-            async with async_playwright() as p:
-                browser = await p.chromium.launch(
-                    headless=True,
-                    args=["--no-sandbox", "--disable-setuid-sandbox", "--disable-blink-features=AutomationControlled"]
-                )
-                context = await browser.new_context(
-                    locale="en-US",
-                    timezone_id="Africa/Addis_Ababa",
-                    viewport={"width": 1280, "height": 1000},
-                    user_agent=random.choice(user_agents),
-                    extra_http_headers={"Accept-Language": "en-US,en;q=0.9"}
-                )
-                page = await context.new_page()
-                
-                await page.goto("https://www.forexfactory.com/calendar?day=today", timeout=60000)
-                await page.wait_for_timeout(5000)
-                if "verification" in (await page.title()).lower():
-                    await page.wait_for_timeout(15000)
-                await page.wait_for_selector(".calendar__row", timeout=45000)
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await page.wait_for_timeout(2000)
-                await page.evaluate("""
-                    document.querySelectorAll('.calendar__row--event').forEach(row => {
-                        const currEl = row.querySelector('.calendar__currency');
-                        const impEl = row.querySelector('.calendar__impact span');
-                        let hide = false;
-                        if (currEl && currEl.innerText.trim().toUpperCase() !== 'USD') hide = true;
-                        if (impEl) {
-                            const cls = impEl.className;
-                            const txt = impEl.innerText.trim().toLowerCase();
-                            if (!cls.includes('high') && !cls.includes('impact--high') && txt !== 'high') hide = true;
-                        } else hide = true;
-                        if (hide) row.style.display = 'none';
-                    });
-                    document.querySelectorAll('.calendar__row--day-breaker').forEach(r => r.style.display = 'none');
-                """)
-                table = await page.query_selector(".calendar__table")
-                if table:
-                    screenshot = await table.screenshot(type="png")
-                else:
-                    screenshot = await page.screenshot(full_page=True, type="png")
-                await browser.close()
-                return screenshot
-        except Exception as e:
-            log.error(f"Daily screenshot failed: {e}")
-            return None
+        return await self._take_screenshot_via_browserless(
+            "https://www.forexfactory.com/calendar?day=today",
+            wait_selector=".calendar__row",
+            full_page=False
+        )
 
     # ─── VIP selection (unchanged) ─────────────────────────────────────────
     def _select_vip_events(self, events: List[dict]) -> List[dict]:
@@ -499,7 +432,7 @@ class ChannelScraper:
         await self._mem.mark_reminder_sent(key)
         await self._mem.increment_reminder_count(today)
 
-    # ─── Channel processing (unchanged) ─────────────────────────────────────
+    # ─── Channel processing (unchanged, but keep the methods) ───────────────
     async def poll_and_forward(self):
         stats = await self._mem.stats()
         log.info(f"Poll cycle | sources={len(self._sources)} | hashes={stats['tracked_hashes']} | posted_24h={stats['posted_last_24h']}")
@@ -590,7 +523,6 @@ class ChannelScraper:
             log.info(f"✅ Posted id={sent.id} engine={verdict.get('engine')}")
 
     async def _broadcast_media(self, text: str, img: Optional[bytes], mime: str):
-        """Legacy method – kept for channel forwarding (text with optional image)"""
         sent = None
         safe = _clean_caption(text)
         for dest in self._dest_channels:
