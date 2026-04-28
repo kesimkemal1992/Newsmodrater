@@ -1,8 +1,6 @@
 """
 ai_engine.py — Dual-layer AI analysis engine.
-
-No pre‑filters. AI decides everything.
-Adds US flag emoji. Only #XAUUSD #DXY #OIL hashtags.
+Maximum duplicate protection with aggressive similarity threshold (0.55).
 """
 
 import asyncio
@@ -12,7 +10,7 @@ import logging
 import re
 import textwrap
 from datetime import datetime, timezone
-from typing import Optional, Tuple
+from typing import Optional
 
 import google.generativeai as genai
 from groq import AsyncGroq
@@ -37,7 +35,7 @@ def _add_us_flag_emoji(text: str) -> str:
     lines[0] = new_line
     return '\n'.join(lines)
 
-# ─── System prompt – strict formatting, no pre‑filter instructions ──────────
+# ─── System prompt (unchanged from original, full version) ──────────────────
 _SYSTEM_PROMPT = """
 You are AXIOM INTEL — a Senior Institutional Macro & Geopolitical news editor
 for a professional Telegram trading channel. Your audience is experienced traders.
@@ -95,12 +93,14 @@ RESPOND WITH VALID JSON ONLY — NO MARKDOWN FENCES — NO TRAILING COMMAS:
 {"approved": true, "reason": "brief reason", "issues": [], "formatted_text": "post text here without signature", "confidence": 0.9}
 """.strip()
 
-# ─── Similarity check prompt (strengthened) ─────────────────────────────────
+# ─── Similarity check prompts (aggressive) ──────────────────────────────────
 _SIMILARITY_PROMPT = """
 You are a duplicate news detector for financial/geopolitical news.
 Compare the two stories below. If they describe the same real-world event,
 even if worded differently, in different languages, with different lengths,
 or with minor spelling mistakes, respond with same_story=true.
+
+IMPORTANT: Be aggressive. If there is any reasonable chance they are the same event, mark same_story=true.
 
 Story A: {story_a}
 Story B: {story_b}
@@ -108,7 +108,6 @@ Story B: {story_b}
 Respond in JSON: {{"same_story": true/false, "confidence": 0.0-1.0, "reason": "..."}}
 """
 
-# ─── Similarity for multimodal (text + image) ───────────────────────────────
 _MULTIMODAL_SIMILARITY_PROMPT = """
 You are a duplicate news detector. Compare the two news items below.
 Each contains text and possibly an image. Decide if they are the SAME real-world event.
@@ -120,10 +119,12 @@ Item B text: {text_b}
 Pay attention: If the images show the same chart, same calendar page, same person, or same event scene,
 and the texts agree, then they are duplicates.
 
+Be aggressive: if there is any reasonable chance they are the same, mark same_story=true.
+
 Respond with JSON: {{"same_story": true, "confidence": 0.0-1.0, "reason": "..."}}
 """
 
-# ─── ForexFactory image analysis prompts (unchanged) ─────────────────────────
+# ─── ForexFactory image analysis prompts ────────────────────────────────────
 _FF_IMAGE_PROMPT = """
 You are analysing a ForexFactory economic calendar screenshot posted in a Telegram channel.
 
@@ -392,7 +393,7 @@ class AIEngine:
             log.error(f"Both engines failed — safe reject.")
             return _reject("Both AI engines unavailable.", "engine_error", confidence=0.0)
 
-    # ─── Similarity check (supports text + optional images) ──────────────────
+    # ─── Aggressive duplicate detection (threshold 0.55) ──────────────────────
     async def is_same_story(
         self,
         text_a: str,
@@ -400,14 +401,10 @@ class AIEngine:
         image_a: Optional[bytes] = None,
         image_b: Optional[bytes] = None,
     ) -> bool:
-        """Compare two stories (text + optional images). Returns True if duplicate."""
+        """Compare two stories (text + optional images). Returns True if same."""
         if not text_a and not text_b and not image_a and not image_b:
             return False
 
-        # Fast path: if both have images, compute perceptual hash externally
-        # (the caller already does that; here we rely on AI for semantic match)
-
-        # Build prompt
         if image_a or image_b:
             prompt = _MULTIMODAL_SIMILARITY_PROMPT.format(
                 text_a=(text_a[:400] if text_a else "(no text)"),
@@ -419,9 +416,7 @@ class AIEngine:
                 story_b=(text_b[:500] if text_b else ""),
             )
 
-        # Call AI (Gemini vision because it can handle images if needed)
         try:
-            # If images are provided, we send them to the vision model
             parts = []
             if image_a:
                 parts.append({"inline_data": {"mime_type": "image/jpeg", "data": _b64(image_a)}})
@@ -438,8 +433,8 @@ class AIEngine:
             same = bool(data.get("same_story", False))
             conf = data.get("confidence", 0)
             log.info(f"Similarity → same={same} | conf={conf}")
-            # Lowered threshold to 0.65 for catching reworded stories
-            return same and conf >= 0.65
+            # Aggressive threshold (0.55) catches more duplicates
+            return same and conf >= 0.55
         except Exception as exc:
             log.warning(f"Similarity check failed: {exc} — assuming not duplicate.")
             return False
@@ -458,9 +453,13 @@ class AIEngine:
         else:
             prompt = _FF_IMAGE_PROMPT.format(today_date=today_date)
         parts = [{"inline_data": {"mime_type": image_mime, "data": _b64(image_data)}}, prompt]
+
         try:
             loop = asyncio.get_event_loop()
-            resp = await asyncio.wait_for(loop.run_in_executor(None, lambda: self._gemini_vision.generate_content(parts)), timeout=45)
+            resp = await asyncio.wait_for(
+                loop.run_in_executor(None, lambda: self._gemini_vision.generate_content(parts)),
+                timeout=45,
+            )
             data = _parse_json(resp.text)
             log.info(f"FF image → approved={data.get('approved')} | {data.get('reason', '')}")
             if data.get("approved") and data.get("formatted_text"):
@@ -468,9 +467,21 @@ class AIEngine:
             return data
         except Exception as exc:
             log.warning(f"Gemini FF failed ({exc}) — trying Groq …")
+
         try:
-            content = [{"type": "image_url", "image_url": {"url": f"data:{image_mime};base64,{_b64(image_data)}"}}, {"type": "text", "text": prompt}]
-            resp = await asyncio.wait_for(self._groq.chat.completions.create(model="meta-llama/llama-4-scout-17b-16e-instruct", messages=[{"role": "user", "content": content}], temperature=0.1, max_tokens=800), timeout=60)
+            content = [
+                {"type": "image_url", "image_url": {"url": f"data:{image_mime};base64,{_b64(image_data)}"}},
+                {"type": "text", "text": prompt},
+            ]
+            resp = await asyncio.wait_for(
+                self._groq.chat.completions.create(
+                    model="meta-llama/llama-4-scout-17b-16e-instruct",
+                    messages=[{"role": "user", "content": content}],
+                    temperature=0.1,
+                    max_tokens=800,
+                ),
+                timeout=60,
+            )
             data = _parse_json(resp.choices[0].message.content)
             log.info(f"Groq FF → approved={data.get('approved')}")
             if data.get("approved") and data.get("formatted_text"):
@@ -575,7 +586,7 @@ class AIEngine:
         text = _add_us_flag_emoji(text)
         return _add_signature(text)
 
-# ─── Module‑level helpers ────────────────────────────────────────────────────
+# ─── Module‑level helpers (outside class) ────────────────────────────────────
 def _reject(reason: str, issue: str, confidence: float = 1.0) -> dict:
     return {
         "approved": False,
