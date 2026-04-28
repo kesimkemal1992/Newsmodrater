@@ -3,7 +3,8 @@ memory.py — SQLite-backed memory manager for AXIOM INTEL.
 
 Tracks:
   • Content hashes — deduplication (hash + AI similarity)
-  • Recent post texts — for AI similarity comparison (last 20)
+  • Perceptual image hashes — fast duplicate image detection
+  • Recent post texts + image hashes — for AI similarity comparison (last 50)
   • Posted messages — full audit log
   • Daily briefings — one per day, stores msg_id + events JSON
   • Weekly calendar — one per week
@@ -17,7 +18,7 @@ import hashlib
 import json
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 import aiosqlite
 
@@ -52,10 +53,17 @@ class MemoryManager:
                 seen_at     TEXT NOT NULL
             );
 
-            CREATE TABLE IF NOT EXISTS recent_post_texts (
+            CREATE TABLE IF NOT EXISTS image_hashes (
+                perceptual_hash TEXT PRIMARY KEY,
+                source_channel  TEXT,
+                seen_at         TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS recent_posts (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 source_text TEXT NOT NULL,
                 post_text   TEXT NOT NULL,
+                image_hash  TEXT,       -- perceptual hash of posted image, if any
                 created_at  TEXT NOT NULL
             );
 
@@ -104,7 +112,7 @@ class MemoryManager:
             );
         """)
 
-    # ── Hash deduplication ────────────────────────────────────────────────────
+    # ── Hash deduplication (exact text+image) ────────────────────────────────
     @staticmethod
     def hash_combined(text: str, image_data: Optional[bytes]) -> str:
         h = hashlib.sha256()
@@ -121,50 +129,53 @@ class MemoryManager:
             return await cur.fetchone() is not None
 
     async def mark_seen(self, content_hash: str, source: str = ""):
-        now = _utcnow()
         await self._db.execute(
             "INSERT OR IGNORE INTO content_hashes (hash, source, seen_at) VALUES (?, ?, ?)",
-            (content_hash, source, now),
+            (content_hash, source, _utcnow()),
         )
         await self._db.commit()
 
-    async def _cleanup_old_hashes(self):
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=self._ttl_days)).isoformat()
-        await self._db.execute(
-            "DELETE FROM content_hashes WHERE seen_at < ?", (cutoff,)
-        )
-        # Keep only last 100 recent post texts
-        await self._db.execute("""
-            DELETE FROM recent_post_texts
-            WHERE id NOT IN (
-                SELECT id FROM recent_post_texts ORDER BY id DESC LIMIT 100
-            )
-        """)
-        await self._db.commit()
-
-    # ── Recent post texts (for AI similarity check) ───────────────────────────
-    async def store_recent_post_text(self, source_text: str, post_text: str):
-        """Store source text of a posted story for future similarity checks."""
-        await self._db.execute(
-            "INSERT INTO recent_post_texts (source_text, post_text, created_at) VALUES (?, ?, ?)",
-            (source_text[:1000], post_text[:1000], _utcnow()),
-        )
-        # Keep only last 50 entries
-        await self._db.execute("""
-            DELETE FROM recent_post_texts
-            WHERE id NOT IN (
-                SELECT id FROM recent_post_texts ORDER BY id DESC LIMIT 50
-            )
-        """)
-        await self._db.commit()
-
-    async def get_recent_post_texts(self, limit: int = 20) -> List[str]:
-        """Return source_text of last N posted stories for similarity comparison."""
+    # ── Image perceptual hash (fast duplicate detection for images) ───────────
+    async def is_image_duplicate(self, perceptual_hash: str) -> bool:
         async with self._db.execute(
-            "SELECT source_text FROM recent_post_texts ORDER BY id DESC LIMIT ?", (limit,)
+            "SELECT 1 FROM image_hashes WHERE perceptual_hash=?", (perceptual_hash,)
+        ) as cur:
+            return await cur.fetchone() is not None
+
+    async def mark_image_seen(self, perceptual_hash: str, source: str = ""):
+        await self._db.execute(
+            "INSERT OR IGNORE INTO image_hashes (perceptual_hash, source_channel, seen_at) VALUES (?, ?, ?)",
+            (perceptual_hash, source, _utcnow()),
+        )
+        await self._db.commit()
+
+    # ── Recent posts (for AI similarity, stores text + image hash) ───────────
+    async def store_recent_post(self, source_text: str, post_text: str, image_hash: Optional[str] = None):
+        await self._db.execute(
+            "INSERT INTO recent_posts (source_text, post_text, image_hash, created_at) VALUES (?, ?, ?, ?)",
+            (source_text[:1000], post_text[:1000], image_hash, _utcnow()),
+        )
+        # Keep only last 100 rows
+        await self._db.execute("""
+            DELETE FROM recent_posts
+            WHERE id NOT IN (
+                SELECT id FROM recent_posts ORDER BY id DESC LIMIT 100
+            )
+        """)
+        await self._db.commit()
+
+    async def get_recent_posts(self, limit: int = 30) -> List[Tuple[str, Optional[str]]]:
+        """Return list of (source_text, image_hash) for last N posts."""
+        async with self._db.execute(
+            "SELECT source_text, image_hash FROM recent_posts ORDER BY id DESC LIMIT ?", (limit,)
         ) as cur:
             rows = await cur.fetchall()
-        return [row["source_text"] for row in rows]
+        return [(row["source_text"], row["image_hash"]) for row in rows]
+
+    async def get_recent_post_texts(self, limit: int = 30) -> List[str]:
+        """Return only source_text for last N posts (backward compatibility)."""
+        posts = await self.get_recent_posts(limit)
+        return [text for text, _ in posts]
 
     # ── Posted messages log ───────────────────────────────────────────────────
     async def log_posted(
@@ -283,6 +294,17 @@ class MemoryManager:
             """INSERT INTO channel_offsets (channel, last_msg_id) VALUES (?, ?)
                ON CONFLICT(channel) DO UPDATE SET last_msg_id = ?""",
             (channel, msg_id, msg_id),
+        )
+        await self._db.commit()
+
+    # ── Cleanup ───────────────────────────────────────────────────────────────
+    async def _cleanup_old_hashes(self):
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=self._ttl_days)).isoformat()
+        await self._db.execute(
+            "DELETE FROM content_hashes WHERE seen_at < ?", (cutoff,)
+        )
+        await self._db.execute(
+            "DELETE FROM image_hashes WHERE seen_at < ?", (cutoff,)
         )
         await self._db.commit()
 
