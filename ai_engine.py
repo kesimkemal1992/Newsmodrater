@@ -1,6 +1,7 @@
+
 """
 ai_engine.py — Dual-layer AI analysis engine.
-Trump/market-moving detection without extra hashtags.
+Supports Trump/Hormuz/Oil supply news, adds US flag emoji, only #XAUUSD #DXY #OIL.
 """
 
 import asyncio
@@ -22,15 +23,18 @@ CHANNEL_SIGNATURE = "\n\n[Squad 4xx](https://t.me/Squad_4xx)"
 # ─── Only three allowed hashtags ────────────────────────────────────────────
 ALLOWED_HASHTAGS = "#XAUUSD #DXY #OIL"
 
-# ─── Trump / market-moving keywords (for prioritisation) ────────────────────
+# ─── Trump / market-moving keywords ─────────────────────────────────────────
 TRUMP_KEYWORDS = [
     "trump", "donald trump", "president trump", "trump's", "trump tariff",
     "trump speech", "trump rally", "trump announcement", "trump media",
     "former president trump", "trump investigation", "trump indictment"
 ]
-MARKET_MOVING_KEYWORDS = [
-    "market moving", "market effect", "volatility alert", "high impact",
-    "risk event", "flash crash", "liquidity flush"
+
+# Additional critical geopolitical triggers (Hormuz, oil supply, Iran, etc.)
+GEOPOLITICAL_TRIGGERS = [
+    "strait of hormuz", "hormuz strait", "oil supply disruption", "oil blockade",
+    "tanker attack", "middle east shipping lane", "iran collapse", "state of collapse",
+    "open the hormuz", "hormuz", "oil embargo", "oil production cut"
 ]
 
 def _is_trump_or_market_moving(text: str) -> bool:
@@ -40,22 +44,37 @@ def _is_trump_or_market_moving(text: str) -> bool:
     for kw in TRUMP_KEYWORDS:
         if kw in text_lower:
             return True
-    for kw in MARKET_MOVING_KEYWORDS:
+    for kw in GEOPOLITICAL_TRIGGERS:
         if kw in text_lower:
             return True
     return False
 
-# ─── System prompt (no extra hashtags, no #GEOPOLITICS) ─────────────────────
-_SYSTEM_PROMPT = """
-You are AXIOM INTEL — a Senior Institutional Macro & Geopolitical news editor
-for a professional Telegram trading channel. Your audience is experienced traders.
+def _add_us_flag_emoji(text: str) -> str:
+    """Add US flag emoji after first occurrence of US or USD in headline."""
+    if not text:
+        return text
+    lines = text.split('\n')
+    if not lines:
+        return text
+    first_line = lines[0]  # headline
+    # Replace "US" or "USD" with "US 🇺🇸" or "USD 🇺🇸" (only once)
+    new_line = re.sub(r'\bUS\b', 'US 🇺🇸', first_line, count=1)
+    new_line = re.sub(r'\bUSD\b', 'USD 🇺🇸', new_line, count=1)
+    lines[0] = new_line
+    return '\n'.join(lines)
 
-SPECIAL INSTRUCTION FOR TRUMP / MARKET-MOVING NEWS:
-- News about Donald Trump, his policies, speeches, or legal developments that could move
-  Gold, Oil, or USD must be treated with HIGH PRIORITY.
-- Always APPROVE such news if it is factual and recent (<18h).
-- Use the 🗳️ emoji for political events that affect markets.
-- Hashtags: ONLY #XAUUSD #DXY #OIL — no other hashtags ever.
+# ─── System prompt (explicit approval for Hormuz/Trump) ─────────────────────
+_SYSTEM_PROMPT = """
+You are AXIOM INTEL — a Senior Institutional Macro & Geopolitical news editor.
+
+CRITICAL RULE FOR ENERGY / STRAIT / TRUMP NEWS:
+- Any mention of "Strait of Hormuz", "Hormuz Strait", "oil supply disruption",
+  "oil blockade", "tanker attack", "Middle East shipping lane", "Iran collapse",
+  "state of collapse", "open the Hormuz" is ALWAYS market-moving.
+- Any statement from Donald Trump, Biden, or any world leader about Iran, Saudi Arabia,
+  Russia, or Venezuela affecting oil production or shipping must be APPROVED.
+- These are HIGH IMPACT geopolitical events even if the source is a social media post.
+- If it affects OIL supply, it affects GOLD and USD. Always approve unless stale (>18h).
 
 YOUR ONLY JOB:
 Take the source content, verify its relevance, and format it cleanly.
@@ -80,9 +99,11 @@ REJECT IF ANY OF THESE APPLY:
 5. WATERMARK     — Another channel logo or username visible on image
 6. STALE         — Content older than 18 hours
 7. OFF-TOPIC     — Not about geopolitics, central banks, macro data,
-                   Gold, Oil, USD — strictly no other topics
-8. LOW VALUE     — Vague, no specific real-world event
-9. DUPLICATE     — Same story already processed (even if worded differently)
+                   Gold, Oil, USD — strictly no other topics.
+                   But remember: Hormuz, oil supply, Trump statements are ON-TOPIC even if informal.
+8. LOW VALUE     — Vague, no specific real-world event.
+                   However, "Iran state of collapse" + "Open Hormuz" is specific and high value.
+9. DUPLICATE     — Same story already processed.
 10. PREDICTION   — "I think", "expect", "my analysis", "in my opinion"
 11. COMMENTARY   — Personal views, market opinions, trade recommendations
 
@@ -370,20 +391,19 @@ class AIEngine:
             ),
         )
 
-    # ─── News moderation with Trump override ──────────────────────────────────
+    # ─── News moderation with Trump/geopolitical override ────────────────────
     async def analyse(
         self,
         text: str,
         image_data: Optional[bytes] = None,
         image_mime: str = "image/jpeg",
     ) -> dict:
-        # Trump / market-moving news bypass pre-filters
+        # Trump / Hormuz / oil supply news bypass pre-filters
         if _is_trump_or_market_moving(text):
-            log.info("[TRUMP/MARKET] Detected — bypassing standard pre-filters")
-            # but still log if signal found (no early reject)
+            log.info("[TRUMP/GEOPOLITICAL] Detected — bypassing standard pre-filters")
             hit = _signal_hit(text)
             if hit:
-                log.warning(f"Signal keyword '{hit}' found but Trump news overrides — AI will decide.")
+                log.warning(f"Signal keyword '{hit}' found but geopolitical news overrides — AI will decide.")
 
         if not _is_trump_or_market_moving(text):
             hit = _signal_hit(text)
@@ -405,6 +425,8 @@ class AIEngine:
             log.info(f"Gemini → approved={verdict['approved']} | {verdict.get('reason', '')}")
             if verdict.get("approved"):
                 verdict["formatted_text"] = _build_post_body(verdict["formatted_text"])
+                # Add US flag emoji if US or USD appears
+                verdict["formatted_text"] = _add_us_flag_emoji(verdict["formatted_text"])
             return verdict
         except Exception as exc:
             log.warning(f"Gemini failed ({exc}) — trying Groq …")
@@ -417,6 +439,7 @@ class AIEngine:
             log.info(f"Groq → approved={verdict['approved']} | {verdict.get('reason', '')}")
             if verdict.get("approved"):
                 verdict["formatted_text"] = _build_post_body(verdict["formatted_text"])
+                verdict["formatted_text"] = _add_us_flag_emoji(verdict["formatted_text"])
             return verdict
         except Exception as exc:
             log.error(f"Both engines failed — safe reject.")
@@ -451,6 +474,8 @@ class AIEngine:
             resp = await asyncio.wait_for(loop.run_in_executor(None, lambda: self._gemini_vision.generate_content(parts)), timeout=45)
             data = _parse_json(resp.text)
             log.info(f"FF image analysis → approved={data.get('approved')} | {data.get('reason', '')}")
+            if data.get("approved") and data.get("formatted_text"):
+                data["formatted_text"] = _add_us_flag_emoji(data["formatted_text"])
             return data
         except Exception as exc:
             log.warning(f"Gemini FF image failed ({exc}) — trying Groq …")
@@ -459,6 +484,8 @@ class AIEngine:
             resp = await asyncio.wait_for(self._groq.chat.completions.create(model="meta-llama/llama-4-scout-17b-16e-instruct", messages=[{"role": "user", "content": content}], temperature=0.1, max_tokens=800), timeout=60)
             data = _parse_json(resp.choices[0].message.content)
             log.info(f"Groq FF image → approved={data.get('approved')}")
+            if data.get("approved") and data.get("formatted_text"):
+                data["formatted_text"] = _add_us_flag_emoji(data["formatted_text"])
             return data
         except Exception as exc:
             log.error(f"Both engines failed for FF image: {exc}")
@@ -477,11 +504,13 @@ class AIEngine:
         try:
             result = await asyncio.wait_for(self._gemini_text_call(prompt), timeout=30)
             log.info(f"Alert generated for: {event.get('name')}")
+            result = _add_us_flag_emoji(result)
             return _add_signature(_strip_asterisks(result.strip()))
         except Exception as exc:
             log.warning(f"Gemini alert failed ({exc}) — trying Groq …")
         try:
             result = await asyncio.wait_for(self._groq_text_call(prompt), timeout=45)
+            result = _add_us_flag_emoji(result)
             return _add_signature(_strip_asterisks(result.strip()))
         except Exception as exc:
             log.error(f"Both engines failed for alert — using fallback.")
@@ -499,6 +528,7 @@ class AIEngine:
 
             TASK:
             1. Check ALL rejection criteria (signals, TA, memes, charts, opinions, duplicates).
+               But remember: Hormuz, oil supply, Iran collapse, Trump statements are ALWAYS on-topic and high impact.
             2. If image: check for watermarks, TA charts, memes — reject all of these.
             3. If approved: clean and format. English only. 2-4 sentences max.
                Hashtags: ONLY #XAUUSD #DXY #OIL — no other hashtags.
@@ -554,6 +584,7 @@ class AIEngine:
             f"✅ No new entries during the release\n\n"
             f"{line}"
         )
+        text = _add_us_flag_emoji(text)
         return _add_signature(text)
 
 def _reject(reason: str, issue: str, confidence: float = 1.0) -> dict:
