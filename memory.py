@@ -1,150 +1,172 @@
 """
-memory.py — Persistent memory, anti-duplication, and scheduler state engine.
+memory.py — SQLite-backed memory manager for AXIOM INTEL.
 
-Stores:
-  • SHA-256 hashes of every processed message (text + image)
-  • Posted message metadata for analytics
-  • Channel state (last-seen message IDs)
-  • Daily briefing post IDs (for reminder reply threading)
-  • Daily reminder count (anti-spam: max 2 per day)
-  • Reminder schedule state
+Tracks:
+  • Content hashes — deduplication (hash + AI similarity)
+  • Recent post texts — for AI similarity comparison (last 20)
+  • Posted messages — full audit log
+  • Daily briefings — one per day, stores msg_id + events JSON
+  • Weekly calendar — one per week
+  • Reminders — sent status + daily count
+  • Motivational index — rotates across restarts
+  • Last message IDs — per source channel
 """
 
 import asyncio
 import hashlib
 import json
 import logging
-import time
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Optional, List
 
 import aiosqlite
 
 log = logging.getLogger("memory")
 
-# ─── Schema ───────────────────────────────────────────────────────────────────
-_DDL = """
-CREATE TABLE IF NOT EXISTS content_hashes (
-    hash        TEXT PRIMARY KEY,
-    source      TEXT,
-    created_at  REAL NOT NULL,
-    expires_at  REAL NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS posted_messages (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    source_channel  TEXT,
-    source_msg_id   INTEGER,
-    dest_msg_id     INTEGER,
-    content_hash    TEXT,
-    posted_at       REAL NOT NULL,
-    ai_verdict      TEXT,
-    formatted_text  TEXT
-);
-
-CREATE TABLE IF NOT EXISTS channel_stats (
-    channel     TEXT PRIMARY KEY,
-    last_msg_id INTEGER DEFAULT 0,
-    last_seen   REAL
-);
-
--- Tracks the morning daily briefing post (so reminders can reply to it)
-CREATE TABLE IF NOT EXISTS daily_briefings (
-    date_str        TEXT PRIMARY KEY,   -- YYYY-MM-DD in EAT timezone
-    dest_msg_id     INTEGER NOT NULL,   -- Telegram message ID to reply to
-    posted_at       REAL NOT NULL,
-    events_json     TEXT                -- serialised list of events
-);
-
--- Tracks how many reminders have been sent today (max 2 per day)
-CREATE TABLE IF NOT EXISTS daily_reminders (
-    date_str        TEXT PRIMARY KEY,   -- YYYY-MM-DD in EAT timezone
-    count           INTEGER DEFAULT 0,
-    last_sent       REAL
-);
-
--- Tracks which events have already had their reminder sent
-CREATE TABLE IF NOT EXISTS sent_reminders (
-    event_key       TEXT PRIMARY KEY,   -- "{date_str}_{event_name}_{currency}"
-    sent_at         REAL NOT NULL
-);
-
--- Tracks the global motivational line index (cycles through the pool)
-CREATE TABLE IF NOT EXISTS motivational_state (
-    id          INTEGER PRIMARY KEY CHECK (id = 1),
-    line_index  INTEGER DEFAULT 0,
-    updated_at  REAL
-);
-INSERT OR IGNORE INTO motivational_state (id, line_index, updated_at) VALUES (1, 0, 0);
-
-CREATE INDEX IF NOT EXISTS idx_hashes_expires ON content_hashes(expires_at);
-CREATE INDEX IF NOT EXISTS idx_posted_source  ON posted_messages(source_channel, source_msg_id);
-"""
-
 
 class MemoryManager:
     def __init__(self, db_path: str = "memory.db", ttl_days: int = 30):
         self._db_path = db_path
-        self._ttl_seconds = ttl_days * 86_400
+        self._ttl_days = ttl_days
         self._db: Optional[aiosqlite.Connection] = None
-        self._lock = asyncio.Lock()
 
-    # ── Lifecycle ──────────────────────────────────────────────────────────────
     async def init(self):
         self._db = await aiosqlite.connect(self._db_path)
         self._db.row_factory = aiosqlite.Row
-        await self._db.executescript(_DDL)
+        await self._db.execute("PRAGMA journal_mode=WAL")
+        await self._create_tables()
         await self._db.commit()
-        await self._evict_expired()
-        log.info(f"Memory DB initialised at {self._db_path}")
+        await self._cleanup_old_hashes()
+        log.info(f"✅  MemoryManager ready — db={self._db_path} | ttl={self._ttl_days}d")
 
     async def close(self):
         if self._db:
             await self._db.close()
 
-    # ── Hashing helpers ────────────────────────────────────────────────────────
-    @staticmethod
-    def hash_text(text: str) -> str:
-        normalised = " ".join(text.lower().split())
-        return hashlib.sha256(normalised.encode()).hexdigest()
+    # ── Schema ────────────────────────────────────────────────────────────────
+    async def _create_tables(self):
+        await self._db.executescript("""
+            CREATE TABLE IF NOT EXISTS content_hashes (
+                hash        TEXT PRIMARY KEY,
+                source      TEXT,
+                seen_at     TEXT NOT NULL
+            );
 
-    @staticmethod
-    def hash_bytes(data: bytes) -> str:
-        return hashlib.sha256(data).hexdigest()
+            CREATE TABLE IF NOT EXISTS recent_post_texts (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_text TEXT NOT NULL,
+                post_text   TEXT NOT NULL,
+                created_at  TEXT NOT NULL
+            );
 
+            CREATE TABLE IF NOT EXISTS posted_messages (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_channel  TEXT NOT NULL,
+                source_msg_id   INTEGER NOT NULL,
+                dest_msg_id     INTEGER NOT NULL,
+                content_hash    TEXT NOT NULL,
+                engine          TEXT,
+                confidence      REAL,
+                formatted_text  TEXT,
+                posted_at       TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS daily_briefings (
+                date_str    TEXT PRIMARY KEY,
+                msg_id      INTEGER NOT NULL,
+                events_json TEXT,
+                posted_at   TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS weekly_calendar (
+                week_key    TEXT PRIMARY KEY,
+                posted_at   TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS reminders (
+                event_key   TEXT PRIMARY KEY,
+                sent_at     TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS reminder_counts (
+                date_str    TEXT PRIMARY KEY,
+                count       INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS channel_offsets (
+                channel     TEXT PRIMARY KEY,
+                last_msg_id INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS kv_store (
+                key         TEXT PRIMARY KEY,
+                value       TEXT NOT NULL
+            );
+        """)
+
+    # ── Hash deduplication ────────────────────────────────────────────────────
     @staticmethod
     def hash_combined(text: str, image_data: Optional[bytes]) -> str:
         h = hashlib.sha256()
         if text:
-            h.update(" ".join(text.lower().split()).encode())
+            h.update(text.encode("utf-8", errors="replace"))
         if image_data:
-            h.update(image_data)
+            h.update(image_data[:4096])
         return h.hexdigest()
 
-    # ── Deduplication ──────────────────────────────────────────────────────────
     async def is_duplicate(self, content_hash: str) -> bool:
-        async with self._lock:
-            now = time.time()
-            async with self._db.execute(
-                "SELECT 1 FROM content_hashes WHERE hash=? AND expires_at>?",
-                (content_hash, now),
-            ) as cur:
-                row = await cur.fetchone()
-            return row is not None
+        async with self._db.execute(
+            "SELECT 1 FROM content_hashes WHERE hash=?", (content_hash,)
+        ) as cur:
+            return await cur.fetchone() is not None
 
     async def mark_seen(self, content_hash: str, source: str = ""):
-        now = time.time()
-        expires = now + self._ttl_seconds
-        async with self._lock:
-            await self._db.execute(
-                """INSERT OR REPLACE INTO content_hashes
-                   (hash, source, created_at, expires_at)
-                   VALUES (?, ?, ?, ?)""",
-                (content_hash, source, now, expires),
-            )
-            await self._db.commit()
+        now = _utcnow()
+        await self._db.execute(
+            "INSERT OR IGNORE INTO content_hashes (hash, source, seen_at) VALUES (?, ?, ?)",
+            (content_hash, source, now),
+        )
+        await self._db.commit()
 
-    # ── Posted log ─────────────────────────────────────────────────────────────
+    async def _cleanup_old_hashes(self):
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=self._ttl_days)).isoformat()
+        await self._db.execute(
+            "DELETE FROM content_hashes WHERE seen_at < ?", (cutoff,)
+        )
+        # Keep only last 100 recent post texts
+        await self._db.execute("""
+            DELETE FROM recent_post_texts
+            WHERE id NOT IN (
+                SELECT id FROM recent_post_texts ORDER BY id DESC LIMIT 100
+            )
+        """)
+        await self._db.commit()
+
+    # ── Recent post texts (for AI similarity check) ───────────────────────────
+    async def store_recent_post_text(self, source_text: str, post_text: str):
+        """Store source text of a posted story for future similarity checks."""
+        await self._db.execute(
+            "INSERT INTO recent_post_texts (source_text, post_text, created_at) VALUES (?, ?, ?)",
+            (source_text[:1000], post_text[:1000], _utcnow()),
+        )
+        # Keep only last 50 entries
+        await self._db.execute("""
+            DELETE FROM recent_post_texts
+            WHERE id NOT IN (
+                SELECT id FROM recent_post_texts ORDER BY id DESC LIMIT 50
+            )
+        """)
+        await self._db.commit()
+
+    async def get_recent_post_texts(self, limit: int = 20) -> List[str]:
+        """Return source_text of last N posted stories for similarity comparison."""
+        async with self._db.execute(
+            "SELECT source_text FROM recent_post_texts ORDER BY id DESC LIMIT ?", (limit,)
+        ) as cur:
+            rows = await cur.fetchall()
+        return [row["source_text"] for row in rows]
+
+    # ── Posted messages log ───────────────────────────────────────────────────
     async def log_posted(
         self,
         source_channel: str,
@@ -154,170 +176,130 @@ class MemoryManager:
         ai_verdict: dict,
         formatted_text: str,
     ):
-        async with self._lock:
-            await self._db.execute(
-                """INSERT INTO posted_messages
-                   (source_channel, source_msg_id, dest_msg_id,
-                    content_hash, posted_at, ai_verdict, formatted_text)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    source_channel,
-                    source_msg_id,
-                    dest_msg_id,
-                    content_hash,
-                    time.time(),
-                    json.dumps(ai_verdict, ensure_ascii=False),
-                    formatted_text,
-                ),
-            )
-            await self._db.commit()
+        await self._db.execute(
+            """INSERT INTO posted_messages
+               (source_channel, source_msg_id, dest_msg_id, content_hash,
+                engine, confidence, formatted_text, posted_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                source_channel, source_msg_id, dest_msg_id, content_hash,
+                ai_verdict.get("engine", ""), ai_verdict.get("confidence", 0.0),
+                formatted_text, _utcnow(),
+            ),
+        )
+        await self._db.commit()
 
-    # ── Channel state ──────────────────────────────────────────────────────────
-    async def get_last_msg_id(self, channel: str) -> int:
+    # ── Daily briefing ────────────────────────────────────────────────────────
+    async def has_daily_briefing(self, date_str: str) -> bool:
         async with self._db.execute(
-            "SELECT last_msg_id FROM channel_stats WHERE channel=?", (channel,)
+            "SELECT 1 FROM daily_briefings WHERE date_str=?", (date_str,)
         ) as cur:
-            row = await cur.fetchone()
-        return row["last_msg_id"] if row else 0
+            return await cur.fetchone() is not None
 
-    async def set_last_msg_id(self, channel: str, msg_id: int):
-        async with self._lock:
-            await self._db.execute(
-                """INSERT INTO channel_stats (channel, last_msg_id, last_seen)
-                   VALUES (?, ?, ?)
-                   ON CONFLICT(channel) DO UPDATE
-                   SET last_msg_id=excluded.last_msg_id,
-                       last_seen=excluded.last_seen""",
-                (channel, msg_id, time.time()),
-            )
-            await self._db.commit()
-
-    # ── Daily Briefing Tracking ────────────────────────────────────────────────
-    async def save_daily_briefing(self, date_str: str, dest_msg_id: int, events: list):
-        """Store the morning briefing message ID so reminders can reply to it."""
-        async with self._lock:
-            await self._db.execute(
-                """INSERT OR REPLACE INTO daily_briefings
-                   (date_str, dest_msg_id, posted_at, events_json)
-                   VALUES (?, ?, ?, ?)""",
-                (date_str, dest_msg_id, time.time(), json.dumps(events, ensure_ascii=False)),
-            )
-            await self._db.commit()
-        log.info(f"Daily briefing saved: date={date_str}, msg_id={dest_msg_id}")
+    async def save_daily_briefing(self, date_str: str, msg_id: int, events: list):
+        await self._db.execute(
+            """INSERT OR REPLACE INTO daily_briefings
+               (date_str, msg_id, events_json, posted_at)
+               VALUES (?, ?, ?, ?)""",
+            (date_str, msg_id, json.dumps(events, ensure_ascii=False), _utcnow()),
+        )
+        await self._db.commit()
 
     async def get_daily_briefing_msg_id(self, date_str: str) -> Optional[int]:
-        """Return the Telegram message ID of today's briefing post (for reply threading)."""
         async with self._db.execute(
-            "SELECT dest_msg_id FROM daily_briefings WHERE date_str=?", (date_str,)
+            "SELECT msg_id FROM daily_briefings WHERE date_str=?", (date_str,)
         ) as cur:
             row = await cur.fetchone()
-        return row["dest_msg_id"] if row else None
+        return row["msg_id"] if row else None
 
-    async def has_daily_briefing(self, date_str: str) -> bool:
-        """Check if morning briefing was already posted today."""
-        msg_id = await self.get_daily_briefing_msg_id(date_str)
-        return msg_id is not None
-
-    # ── Reminder Anti-Spam ────────────────────────────────────────────────────
-    async def get_reminder_count_today(self, date_str: str) -> int:
-        """Return how many reminders have been sent today."""
+    # ── Weekly calendar ───────────────────────────────────────────────────────
+    async def has_weekly_posted(self, week_key: str) -> bool:
         async with self._db.execute(
-            "SELECT count FROM daily_reminders WHERE date_str=?", (date_str,)
+            "SELECT 1 FROM weekly_calendar WHERE week_key=?", (week_key,)
+        ) as cur:
+            return await cur.fetchone() is not None
+
+    async def save_weekly_posted(self, week_key: str):
+        await self._db.execute(
+            "INSERT OR REPLACE INTO weekly_calendar (week_key, posted_at) VALUES (?, ?)",
+            (week_key, _utcnow()),
+        )
+        await self._db.commit()
+
+    # ── Reminders ────────────────────────────────────────────────────────────
+    async def has_reminder_been_sent(self, event_key: str) -> bool:
+        async with self._db.execute(
+            "SELECT 1 FROM reminders WHERE event_key=?", (event_key,)
+        ) as cur:
+            return await cur.fetchone() is not None
+
+    async def mark_reminder_sent(self, event_key: str):
+        await self._db.execute(
+            "INSERT OR IGNORE INTO reminders (event_key, sent_at) VALUES (?, ?)",
+            (event_key, _utcnow()),
+        )
+        await self._db.commit()
+
+    async def get_reminder_count_today(self, date_str: str) -> int:
+        async with self._db.execute(
+            "SELECT count FROM reminder_counts WHERE date_str=?", (date_str,)
         ) as cur:
             row = await cur.fetchone()
         return row["count"] if row else 0
 
     async def increment_reminder_count(self, date_str: str):
-        """Increment the reminder counter for today (called after each reminder sent)."""
-        async with self._lock:
-            await self._db.execute(
-                """INSERT INTO daily_reminders (date_str, count, last_sent)
-                   VALUES (?, 1, ?)
-                   ON CONFLICT(date_str) DO UPDATE
-                   SET count=count+1, last_sent=excluded.last_sent""",
-                (date_str, time.time()),
-            )
-            await self._db.commit()
+        await self._db.execute(
+            """INSERT INTO reminder_counts (date_str, count) VALUES (?, 1)
+               ON CONFLICT(date_str) DO UPDATE SET count = count + 1""",
+            (date_str,),
+        )
+        await self._db.commit()
 
-    async def has_reminder_been_sent(self, event_key: str) -> bool:
-        """Check if a reminder for a specific event has already been sent."""
+    # ── Motivational index ────────────────────────────────────────────────────
+    async def get_and_increment_motivational_index(self) -> int:
         async with self._db.execute(
-            "SELECT 1 FROM sent_reminders WHERE event_key=?", (event_key,)
+            "SELECT value FROM kv_store WHERE key='motivational_index'"
         ) as cur:
             row = await cur.fetchone()
-        return row is not None
-
-    async def mark_reminder_sent(self, event_key: str):
-        """Mark that a reminder for this event has been sent."""
-        async with self._lock:
-            await self._db.execute(
-                "INSERT OR IGNORE INTO sent_reminders (event_key, sent_at) VALUES (?, ?)",
-                (event_key, time.time()),
-            )
-            await self._db.commit()
-
-    # ── Motivational Index ─────────────────────────────────────────────────────
-    async def get_and_increment_motivational_index(self) -> int:
-        """
-        Return current motivational line index, then increment it.
-        Cycles through pool of 20 lines. Persists across restarts.
-        """
-        async with self._lock:
-            async with self._db.execute(
-                "SELECT line_index FROM motivational_state WHERE id=1"
-            ) as cur:
-                row = await cur.fetchone()
-            current = row["line_index"] if row else 0
-            next_index = (current + 1) % 20  # pool size = 20
-            await self._db.execute(
-                "UPDATE motivational_state SET line_index=?, updated_at=? WHERE id=1",
-                (next_index, __import__("time").time()),
-            )
-            await self._db.commit()
+        current = int(row["value"]) if row else 0
+        next_val = current + 1
+        await self._db.execute(
+            "INSERT OR REPLACE INTO kv_store (key, value) VALUES ('motivational_index', ?)",
+            (str(next_val),),
+        )
+        await self._db.commit()
         return current
 
-    # ── Eviction ───────────────────────────────────────────────────────────────
-    async def _evict_expired(self):
-        now = time.time()
-        async with self._lock:
-            cur = await self._db.execute(
-                "DELETE FROM content_hashes WHERE expires_at<=?", (now,)
-            )
-            # Also clean up old reminder records (older than 7 days)
-            old_threshold = now - (7 * 86_400)
-            await self._db.execute(
-                "DELETE FROM sent_reminders WHERE sent_at<?", (old_threshold,)
-            )
-            await self._db.commit()
-        if cur.rowcount:
-            log.info(f"Evicted {cur.rowcount} expired content hashes.")
-
-    # ── Stats ──────────────────────────────────────────────────────────────────
-    async def stats(self) -> dict:
+    # ── Channel offsets ───────────────────────────────────────────────────────
+    async def get_last_msg_id(self, channel: str) -> int:
         async with self._db.execute(
-            "SELECT COUNT(*) AS n FROM content_hashes"
+            "SELECT last_msg_id FROM channel_offsets WHERE channel=?", (channel,)
         ) as cur:
+            row = await cur.fetchone()
+        return row["last_msg_id"] if row else 0
+
+    async def set_last_msg_id(self, channel: str, msg_id: int):
+        await self._db.execute(
+            """INSERT INTO channel_offsets (channel, last_msg_id) VALUES (?, ?)
+               ON CONFLICT(channel) DO UPDATE SET last_msg_id = ?""",
+            (channel, msg_id, msg_id),
+        )
+        await self._db.commit()
+
+    # ── Stats ─────────────────────────────────────────────────────────────────
+    async def stats(self) -> dict:
+        cutoff_24h = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+        async with self._db.execute("SELECT COUNT(*) as n FROM content_hashes") as cur:
             hashes = (await cur.fetchone())["n"]
         async with self._db.execute(
-            "SELECT COUNT(*) AS n FROM posted_messages"
-        ) as cur:
-            posted = (await cur.fetchone())["n"]
-        async with self._db.execute(
-            "SELECT COUNT(*) AS n FROM posted_messages WHERE posted_at > ?",
-            (time.time() - 86_400,),
+            "SELECT COUNT(*) as n FROM posted_messages WHERE posted_at > ?", (cutoff_24h,)
         ) as cur:
             posted_24h = (await cur.fetchone())["n"]
-
-        # Get today's reminder count
-        from datetime import datetime, timezone
-        import pytz
-        eat = pytz.timezone("Africa/Addis_Ababa")
-        today_str = datetime.now(eat).strftime("%Y-%m-%d")
-        pending_reminders = await self.get_reminder_count_today(today_str)
-
         return {
             "tracked_hashes": hashes,
-            "total_posted": posted,
             "posted_last_24h": posted_24h,
-            "pending_reminders": pending_reminders,
         }
+
+
+def _utcnow() -> str:
+    return datetime.now(timezone.utc).isoformat()
