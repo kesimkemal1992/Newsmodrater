@@ -5,8 +5,7 @@ Primary  : Gemini 2.5 Flash  (google-generativeai)
 Fallback : Groq llama-4-scout (vision capable)
 
 Style: Senior Institutional Trader — English only, minimalist, direct.
-       NO asterisks. NO markdown bolding. Data-first. 12-hour AM/PM time format.
-       USD Red impact only. No EAT/GMT+3 labels in output.
+       NO asterisks. NO markdown. NO forecast/previous. 12-hour AM/PM only.
 """
 
 import asyncio
@@ -23,7 +22,13 @@ from groq import AsyncGroq
 
 log = logging.getLogger("ai_engine")
 
-# ─── News Moderation System Prompt ────────────────────────────────────────────
+# ─── Channel signature ────────────────────────────────────────────────────────
+CHANNEL_SIGNATURE = "\n\n[Squad 4xx](https://t.me/Squad_4xx)"
+
+# ─── Allowed hashtags for geopolitical news ──────────────────────────────────
+ALLOWED_HASHTAGS = "#XAUUSD #DXY #OIL"
+
+# ─── News Moderation System Prompt ───────────────────────────────────────────
 _SYSTEM_PROMPT = """
 You are AXIOM INTEL — a Senior Institutional Macro & Geopolitical news editor
 for a professional Telegram trading channel. Your audience is experienced traders.
@@ -33,139 +38,158 @@ Take the source content, verify its relevance, and format it cleanly.
 Do NOT speculate. Do NOT add analysis beyond the facts.
 Do NOT change the meaning. Format it professionally and precisely.
 
-CRITICAL FORMATTING RULE:
-DO NOT use asterisks (*) or any markdown bolding anywhere in the output.
-Use ONLY plain text, emojis, and hashtags. No bold. No italic. No markdown.
-Do NOT write EAT, GMT+3, or Addis Ababa Time anywhere in output.
+CRITICAL FORMATTING RULES:
+- DO NOT use asterisks (*) or any markdown bolding anywhere
+- Use ONLY plain text and emojis
+- NO NOTE line. NO MARKET STATUS line. NO commentary line at the end.
+- NO forecast, NO previous data — never include numbers or data tables
+- Hashtags: ONLY use #XAUUSD #DXY #OIL — no other hashtags ever
+- Do NOT add signature — it is added automatically after
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 REJECT IF ANY OF THESE APPLY:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 1. SIGNALS       — Buy / Sell / Long / Short / Entry / TP / SL / price targets
-2. CHART ONLY    — Image with no news context
-3. WATERMARK     — Another channel logo or username on image
-4. STALE         — Content older than 18 hours
-5. OFF-TOPIC     — Not about USD-related geopolitics, central banks, CPI/NFP/GDP,
-                   Gold, Oil, major USD pairs, US interest rates
-6. LOW VALUE     — Vague, no specific event or data point
-7. DUPLICATE     — Essentially same content already processed
-8. NON-USD       — Currency is NOT USD. Always reject EUR, GBP, JPY, AUD, CAD, CHF, NZD
-9. ORANGE IMPACT — Event impact is Orange/Medium. Only Red/High USD events are allowed
+2. CHART / TA    — Technical analysis, chart patterns, indicators, setups
+3. MEME          — Meme images, jokes, informal content, opinion posts
+4. ANALYSIS IMG  — Chart screenshots, TA images, trade idea images
+5. WATERMARK     — Another channel logo or username visible on image
+6. STALE         — Content older than 18 hours
+7. OFF-TOPIC     — Not about geopolitics, central banks, macro data,
+                   Gold, Oil, USD — strictly no other topics
+8. LOW VALUE     — Vague, no specific real-world event
+9. DUPLICATE     — Same story already processed (even if worded differently)
+10. PREDICTION   — "I think", "expect", "my analysis", "in my opinion"
+11. COMMENTARY   — Personal views, market opinions, trade recommendations
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-APPROVED CONTENT — must meet ALL of these:
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-✅ Currency = USD only
-✅ Impact   = Red 🔴 (High) only — Orange/Medium always rejected
-✅ Topic is directly USD-market relevant (NFP, CPI, FOMC, GDP, Fed Chair, Gold, Oil)
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-FORMAT (if approved):
+FORMAT (if approved — geopolitical/macro news only):
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 [EMOJI] [SHORT ENGLISH HEADLINE — one line, factual and direct]
 
-[Source content lightly cleaned. English only. NO bold. NO asterisks.
-2-4 sentences max. Do not add anything new.]
+[Source content lightly cleaned. English only. 2-4 sentences max.
+Plain facts only. No bold. No asterisks. Do not add anything new.]
 
-📌 NOTE: [ONE short line on likely market impact — plain text only,
-   no asterisks, e.g. "Focus: USD liquidity expansion ahead of FOMC." or
-   "Gold safe-haven demand elevated on geopolitical risk."]
+#XAUUSD #DXY #OIL
 
-#PAIR1 #PAIR2
-
-RULES:
-• English ONLY. No Amharic or other languages.
-• ZERO asterisks anywhere — not for bold, not for any reason
-• Plain text only for all content
-• 12-hour time format: 03:30 PM, 08:00 AM (never 24-hour)
-• Do NOT write EAT, GMT+3, or Addis Ababa Time in output
-• Total post: 60-120 words MAX
-• Hashtags only for instruments directly mentioned
-• No #forex #trading #market #signals #news
-
-EMOJI — pick ONE that matches:
-  🚨 Breaking news     🌍 Geopolitics
-  📊 Economic data     🏦 Central bank
+EMOJI — pick ONE that matches the story:
+  🚨 Breaking news     🌍 Geopolitics / war / sanctions
+  📊 Economic data     🏦 Central bank decision
   🛢️ Oil/energy        🏆 Gold/commodities
-  💵 USD/FX flows      ⚠️ Risk event
+  💵 USD/FX flows      ⚠️ Risk event / crisis
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RESPOND WITH VALID JSON ONLY — NO MARKDOWN FENCES — NO TRAILING COMMAS:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-{"approved": true, "reason": "brief reason", "issues": [], "formatted_text": "post here", "hashtags": "#PAIR1", "confidence": 0.9}
+{"approved": true, "reason": "brief reason", "issues": [], "formatted_text": "post text here without signature", "confidence": 0.9}
 """.strip()
 
-# ─── Daily Briefing Prompt ─────────────────────────────────────────────────────
-_BRIEFING_PROMPT_TEMPLATE = """
-You are a Senior Institutional Trader writing a morning economic calendar briefing.
+# ─── Similarity check prompt ──────────────────────────────────────────────────
+_SIMILARITY_PROMPT = """
+You are a duplicate news detector.
+
+Compare these two news stories and decide if they are about the SAME real-world event.
+Ignore differences in wording, language, or phrasing — only judge the underlying story.
+
+Story A:
+{story_a}
+
+Story B:
+{story_b}
+
+Are these the same story? Respond with JSON only:
+{"same_story": true, "confidence": 0.95, "reason": "brief reason"}
+""".strip()
+
+# ─── ForexFactory image analysis prompt ──────────────────────────────────────
+_FF_IMAGE_PROMPT = """
+You are analysing a ForexFactory economic calendar screenshot posted in a Telegram channel.
+
+TODAY'S DATE: {today_date}
+
+YOUR TASKS:
+1. Confirm this is a real ForexFactory calendar image (not a meme, chart, or other image)
+2. Confirm it shows TODAY's date ({today_date}) — reject if it shows another date
+3. Extract only USD high-impact (Red) and medium-impact (Orange) events visible
+4. Format a clean daily briefing — NO forecast, NO previous data
 
 STRICT RULES:
-- DO NOT use asterisks (*) or any markdown bolding anywhere
-- Do NOT write EAT, GMT+3, or Addis Ababa Time anywhere in output
-- Plain text and emojis ONLY
-- English only
-- Times in 12-hour AM/PM format
-- If Forecast or Previous is unknown, write a dash (—)
-- Sort events chronologically
-- Only include Red (🔴) USD events — skip ALL Orange and ALL non-USD events
+- Only USD events
+- Only Red (🔴) and Orange (🟠) impact
+- Times in 12-hour AM/PM format only (no timezone label)
+- NO forecast values, NO previous values
+- NO NOTE line, NO commentary
+- Plain text only, no asterisks, no bold
+- Do NOT add signature
 
-Today's high-impact events (JSON):
-{events_json}
+If this is NOT a ForexFactory calendar image, or NOT today's date, respond with:
+{{"approved": false, "reason": "not a valid ForexFactory today image"}}
 
-Date: {date_str}
+If valid, respond with:
+{{"approved": true, "reason": "valid FF today image", "formatted_text": "📅 TODAY'S USD HIGH IMPACT NEWS\\nDay, Month DD, YYYY\\n\\n🔴 03:30 PM | USD: Event Name\\n🟠 05:00 PM | USD: Another Event\\n\\nBe careful during these releases."}}
 
-Write the briefing in this EXACT format (no asterisks anywhere):
-
-📅 TODAY'S HIGH IMPACT NEWS
-{date_str}
-
-🔴 03:30 PM | USD: Event Name
-• Forecast: 0.3% | Previous: 0.4%
-
-🔴 05:00 PM | USD: Another Event
-• Forecast: — | Previous: 1.2%
-
-📌 NOTE: [One plain-text sentence on expected volatility or market theme]
-
-Return ONLY the formatted message. No JSON. No markdown. No asterisks.
+RESPOND WITH VALID JSON ONLY — NO MARKDOWN FENCES — NO TRAILING COMMAS.
 """.strip()
 
-# ─── 10-Minute Alert Prompt ────────────────────────────────────────────────────
+# ─── Weekly calendar image analysis prompt ───────────────────────────────────
+_FF_WEEKLY_IMAGE_PROMPT = """
+You are analysing a ForexFactory economic calendar screenshot for the weekly outlook.
+
+CURRENT WEEK: {week_range}
+
+YOUR TASKS:
+1. Confirm this is a real ForexFactory calendar image
+2. Extract USD high-impact (Red) and medium-impact (Orange) events for this week
+3. Format a clean weekly calendar — NO forecast, NO previous data
+
+STRICT RULES:
+- Only USD events
+- Only Red (🔴) and Orange (🟠) impact
+- Times in 12-hour AM/PM format only (no timezone label)
+- Group by day
+- NO forecast values, NO previous values
+- NO NOTE line, NO commentary
+- Plain text only, no asterisks, no bold
+- Do NOT add signature
+
+If NOT a valid ForexFactory image, respond with:
+{{"approved": false, "reason": "not a valid ForexFactory calendar image"}}
+
+If valid, respond with JSON containing formatted_text like:
+{{"approved": true, "reason": "valid FF weekly image", "formatted_text": "📅 WEEKLY HIGH IMPACT NEWS\\nWeek of {week_range}\\n\\nMonday — Apr 28\\n🔴 03:30 PM | USD: Event Name\\n\\nFriday — May 02\\n🔴 03:30 PM | USD: NFP"}}
+
+RESPOND WITH VALID JSON ONLY — NO MARKDOWN FENCES — NO TRAILING COMMAS.
+""".strip()
+
+# ─── 10-Minute Alert ─────────────────────────────────────────────────────────
 _ALERT_PROMPT_TEMPLATE = """
 You are a Senior Institutional Trader writing a pre-event warning alert.
 
 STRICT RULES:
 - DO NOT use asterisks (*) or any markdown bolding — plain text only
-- Do NOT write EAT, GMT+3, or Addis Ababa Time anywhere in output
 - English only
-- No NOTE section
-- The motivational closing line is already provided below — copy it exactly, do not change it
-- FORECAST line: only include if {has_forecast} is true
-- PREVIOUS line: only include if {has_previous} is true
-- If both are missing, skip both lines entirely — do not write dashes or empty lines
+- Say NEWS: not EVENT:
+- Do NOT include Forecast or Previous — skip those lines entirely
+- Do NOT add NOTE or commentary
+- Do NOT add signature
+- Copy the motivational closing line exactly as given — do not modify it
 
-Event details:
+News details:
 Name: {event_name}
 Currency: {currency}
 Time: {time_12h}
-Forecast: {forecast}
-Previous: {previous}
-Has Forecast: {has_forecast}
-Has Previous: {has_previous}
 Impact: {impact_emoji}
 
-Motivational closing line (copy exactly, do not modify):
+Motivational closing line (copy exactly):
 {motivational_line}
 
-Write in this EXACT format (skip FORECAST/PREVIOUS lines if not available):
+Write in this EXACT format:
 
 🚨 ALERT: 10 MINUTES REMAINING
 
-EVENT: {impact_emoji} {event_name}
+NEWS: {impact_emoji} {event_name}
 TIME: {time_12h}
-[FORECAST: {forecast}   ← only if has_forecast is true]
-[PREVIOUS: {previous}   ← only if has_previous is true]
 
 REQUIRED ACTION:
 ✅ Secure open profits now
@@ -177,47 +201,6 @@ REQUIRED ACTION:
 Return ONLY the formatted alert. No JSON. No markdown. No asterisks.
 """.strip()
 
-# ─── Weekly Outlook Prompt ─────────────────────────────────────────────────────
-_WEEKLY_PROMPT_TEMPLATE = """
-You are a Senior Institutional Trader writing a Sunday weekly economic outlook.
-
-STRICT RULES:
-- DO NOT use asterisks (*) or any markdown bolding — plain text only
-- Do NOT write EAT, GMT+3, or Addis Ababa Time anywhere in output
-- Use emojis for structure and visual clarity
-- English only
-- Times in 12-hour AM/PM format
-- If Forecast or Previous is unknown, write a dash (—)
-- Group events by day, sorted chronologically
-- Only Red (🔴) USD events — skip ALL Orange and ALL non-USD events
-
-Events this week (JSON):
-{events_json}
-
-Week: {week_range}
-
-Write in this EXACT format (no asterisks anywhere):
-
-📅 WEEKLY HIGH IMPACT OUTLOOK
-Week of {week_range}
-
-Monday — [Date]
-🔴 [time] | USD: [event name]
-  ↳ Forecast: [value] | Previous: [value]
-
-Tuesday — [Date]
-🔴 [time] | USD: [event name]
-  ↳ Forecast: [value] | Previous: [value]
-
-[Continue for all days that have USD Red events]
-
-📌 NOTE:
-[2-3 plain text sentences. Factual institutional summary.
-No asterisks. Mention the most critical USD events and market themes.]
-
-Return ONLY the formatted message. No JSON. No markdown. No asterisks.
-""".strip()
-
 
 def _b64(data: bytes) -> str:
     return base64.b64encode(data).decode()
@@ -227,28 +210,36 @@ def _today_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
-# ─── Rotating Motivational Closer Pool ────────────────────────────────────────
+def _add_signature(text: str) -> str:
+    """Append channel signature to any post."""
+    text = text.strip()
+    if "[Squad 4xx]" not in text:
+        text += CHANNEL_SIGNATURE
+    return text
+
+
+# ─── Rotating Motivational Closer Pool ───────────────────────────────────────
 _MOTIVATIONAL_POOL = [
     "🛡️ Guard your account like it is your last one — because one day, it might be. Stay safe. 🔒",
     "💰 Your account is everything. One reckless trade during news can erase weeks of hard work. 🚫",
     "🔒 Do not risk more than you can afford to lose right now. Protect your balance first. 💡",
-    "⚠️ This is a high-risk moment. Reduce your size, tighten your stop, or stay out completely. 🛑",
-    "🧘 Calm traders keep their accounts. Emotional traders lose them. Breathe and do not overtrade. 💎",
+    "⚠️ Be careful — this is a high-risk moment. Reduce your size or stay out completely. 🛑",
+    "🧘 Calm traders keep their accounts. Emotional traders lose them. Breathe and be careful. 💎",
     "📵 Step away from the chart if you feel the urge to gamble. Your account will thank you. 🙏",
-    "💳 Treat every dollar in your account as irreplaceable. Because getting it back is twice as hard. 📊",
+    "💳 Treat every dollar in your account as irreplaceable. Getting it back is twice as hard. 📊",
     "🔐 A protected account is a surviving account. A surviving account is a winning account. ✅",
-    "🚨 News volatility destroys unprotected accounts in seconds. Be the trader who is still here tomorrow. 📅",
-    "🧠 The best thing you can do right now is nothing. Protect your account and wait for clarity. ⏳",
+    "🚨 Be careful — news spikes destroy unprotected accounts in seconds. Still be here tomorrow. 📅",
+    "🧠 The best thing you can do right now is nothing. Be careful and wait for clarity. ⏳",
     "💵 Never let one news event define your month. Keep your risk small and live to trade again. 🗓️",
-    "🛡️ Move your stop to break-even. Lock in your safety. Your account is more important than this trade. 🔑",
-    "📉 A 20% account loss needs a 25% gain to recover. Protect what you have — it is harder to earn back. 📈",
-    "🚫 Do not add to a losing position during news. That is how accounts go to zero. Stay disciplined. ✋",
-    "💡 The traders who protect their accounts during news events are the ones still trading next year. 🏆",
-    "⏸️ If you have no stop loss right now — close the trade. No exceptions. Protect your account first. 🔒",
-    "🙅 Revenge trading after a news spike is account suicide. Take a break. Your money needs protection. 🛡️",
-    "📌 Write this down: Account survival is the number one priority. Everything else comes after. 💯",
-    "🔴 High impact event active. One wrong move without protection can hurt your account badly. Stay careful. ⚠️",
-    "💰 You worked hard for every dollar in that account. Do not hand it to the market carelessly. Guard it. 🛡️",
+    "🛡️ Move your stop to break-even. Lock in your safety. Your account matters more than this trade. 🔑",
+    "📉 A 20% loss needs a 25% gain to recover. Be careful — protect what you have. 📈",
+    "🚫 Do not add to a losing position during news. That is how accounts go to zero. Be careful. ✋",
+    "💡 Traders who protect their accounts during news events are the ones still trading next year. 🏆",
+    "⏸️ If you have no stop loss right now — close the trade. No exceptions. Be careful. 🔒",
+    "🙅 Revenge trading after a news spike is dangerous. Take a break. Be careful with your account. 🛡️",
+    "📌 Account survival is the number one priority. Everything else comes after. Be careful. 💯",
+    "🔴 Be careful — one wrong move right now can hurt your account badly. Stay disciplined. ⚠️",
+    "💰 You worked hard for every dollar in that account. Be careful and do not give it away. 🛡️",
 ]
 
 
@@ -262,6 +253,13 @@ _SIGNAL_RE = re.compile(
     re.IGNORECASE,
 )
 
+_REJECT_PATTERNS = re.compile(
+    r"\b(setup|trade idea|my plan|in my opinion|i think|i expect|prediction|"
+    r"analysis|meme|chart pattern|support|resistance|trendline|fibonacci|"
+    r"elliott wave|ichimoku|rsi|macd|bollinger|moving average)\b",
+    re.IGNORECASE,
+)
+
 
 def _signal_hit(text: str) -> Optional[str]:
     if not text:
@@ -270,15 +268,11 @@ def _signal_hit(text: str) -> Optional[str]:
     return m.group(0).strip() if m else None
 
 
-def _strip_eat(text: str) -> str:
-    """Safety net: remove any EAT / GMT+3 / Addis Ababa Time that slips through AI output."""
+def _reject_pattern_hit(text: str) -> Optional[str]:
     if not text:
-        return text
-    text = re.sub(r"\bEAT\b", "", text)
-    text = re.sub(r"\bGMT\+3\b", "", text)
-    text = re.sub(r"\bAddis Ababa Time\b", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"  +", " ", text)
-    return text.strip()
+        return None
+    m = _REJECT_PATTERNS.search(text)
+    return m.group(0).strip() if m else None
 
 
 def _parse_json(raw: str) -> dict:
@@ -289,20 +283,17 @@ def _parse_json(raw: str) -> dict:
     raw = raw.strip().strip("`").strip()
     raw = re.sub(r",\s*([}\]])", r"\1", raw)
     try:
-        data = json.loads(raw)
-        return _validate_and_clean(data)
+        return _validate_and_clean(json.loads(raw))
     except json.JSONDecodeError:
         pass
     m = re.search(r"\{.*\}", raw, re.DOTALL)
     if m:
-        candidate = m.group()
-        candidate = re.sub(r",\s*([}\]])", r"\1", candidate)
+        candidate = re.sub(r",\s*([}\]])", r"\1", m.group())
         try:
-            data = json.loads(candidate)
-            return _validate_and_clean(data)
+            return _validate_and_clean(json.loads(candidate))
         except json.JSONDecodeError:
             pass
-    log.warning(f"_parse_json: all strategies failed. Raw snippet: {raw[:200]}")
+    log.warning(f"_parse_json failed. Raw snippet: {raw[:200]}")
     raise ValueError(f"No valid JSON found in AI response:\n{raw[:300]}")
 
 
@@ -311,28 +302,35 @@ def _validate_and_clean(data: dict) -> dict:
     data.setdefault("reason", "")
     data.setdefault("issues", [])
     data.setdefault("formatted_text", "")
-    data.setdefault("hashtags", "")
     data.setdefault("confidence", 0.5)
+
     if data.get("formatted_text"):
+        # Strip asterisks
         data["formatted_text"] = data["formatted_text"].replace("*", "")
-        data["formatted_text"] = _strip_eat(data["formatted_text"])
+        # Remove any NOTE lines the AI sneaked in
+        data["formatted_text"] = re.sub(
+            r"📌\s*(NOTE|MARKET STATUS|STATUS)[^\n]*\n?", "", data["formatted_text"]
+        ).strip()
+        # Remove any hashtags other than allowed ones and replace with allowed
+        if data.get("approved"):
+            text = data["formatted_text"]
+            # Strip all hashtags from text body
+            text = re.sub(r"#\w+", "", text).strip()
+            data["formatted_text"] = text
+
+    # Hard reject if signal keyword in output
     if data.get("approved") and _signal_hit(data.get("formatted_text", "")):
-        log.warning("Signal keyword detected in output — hard reject.")
+        log.warning("Signal keyword in output — hard reject.")
         data["approved"] = False
-        data["reason"] = "Signal keyword found in formatted output."
+        data["reason"] = "Signal keyword found in output."
         data["issues"].append("signal_content")
         data["formatted_text"] = ""
-        data["hashtags"] = ""
+
     return data
 
 
-def _clean_output(text: str) -> str:
-    """Strip asterisks and EAT labels from any AI text output."""
-    if not text:
-        return text
-    text = text.replace("*", "")
-    text = _strip_eat(text)
-    return text
+def _strip_asterisks(text: str) -> str:
+    return text.replace("*", "") if text else text
 
 
 class AIEngine:
@@ -340,15 +338,19 @@ class AIEngine:
         self._category = channel_category
         self._groq = AsyncGroq(api_key=groq_key)
         genai.configure(api_key=gemini_key)
+
+        # JSON mode — for news moderation
         self._gemini = genai.GenerativeModel(
             model_name="gemini-2.5-flash",
             system_instruction=_SYSTEM_PROMPT,
             generation_config=genai.GenerationConfig(
                 temperature=0.15,
-                max_output_tokens=500,
+                max_output_tokens=600,
                 response_mime_type="application/json",
             ),
         )
+
+        # Text mode — for alerts, briefings, weekly
         self._gemini_text = genai.GenerativeModel(
             model_name="gemini-2.5-flash",
             generation_config=genai.GenerationConfig(
@@ -357,132 +359,179 @@ class AIEngine:
             ),
         )
 
-    async def analyse(self, text: str, image_data: Optional[bytes] = None, image_mime: str = "image/jpeg") -> dict:
+        # JSON mode — for image analysis (FF calendar)
+        self._gemini_vision = genai.GenerativeModel(
+            model_name="gemini-2.5-flash",
+            generation_config=genai.GenerationConfig(
+                temperature=0.1,
+                max_output_tokens=800,
+                response_mime_type="application/json",
+            ),
+        )
+
+    # ── News Moderation ───────────────────────────────────────────────────────
+    async def analyse(
+        self,
+        text: str,
+        image_data: Optional[bytes] = None,
+        image_mime: str = "image/jpeg",
+    ) -> dict:
+        """Analyse a scraped Telegram message. Returns verdict dict."""
+
+        # Pre-filter: signals
         hit = _signal_hit(text)
         if hit:
-            log.info(f"[PRE-FILTER] Signal keyword '{hit}' — instant reject.")
-            return {
-                "approved": False,
-                "reason": f"Signal keyword detected: '{hit}'",
-                "issues": ["signal_content"],
-                "formatted_text": "",
-                "hashtags": "",
-                "confidence": 1.0,
-                "engine": "pre_filter",
-            }
-        prompt = self._build_moderation_prompt(text)
-        try:
-            verdict = await asyncio.wait_for(self._gemini_call(prompt, image_data, image_mime), timeout=40)
-            verdict["engine"] = "gemini-2.5-flash"
-            log.info(f"Gemini NEWS → approved={verdict['approved']} | {verdict.get('reason', '')}")
-            return verdict
-        except Exception as exc:
-            log.warning(f"Gemini NEWS failed ({exc}) — trying Groq …")
-        try:
-            verdict = await asyncio.wait_for(self._groq_call(prompt, image_data, image_mime), timeout=55)
-            verdict["engine"] = "groq-llama4-scout"
-            log.info(f"Groq NEWS → approved={verdict['approved']} | {verdict.get('reason', '')}")
-            return verdict
-        except Exception as exc:
-            log.error(f"Groq NEWS failed ({exc}) — safe reject.")
-            return {
-                "approved": False,
-                "reason": "Both AI engines unavailable.",
-                "issues": ["engine_error"],
-                "formatted_text": "",
-                "hashtags": "",
-                "confidence": 0.0,
-                "engine": "none",
-            }
+            log.info(f"[PRE-FILTER] Signal '{hit}' — instant reject.")
+            return _reject("Signal keyword detected.", "signal_content")
 
-    async def generate_daily_briefing(self, events: list, date_str: str) -> str:
-        if not events:
-            return ""
-        # Hard pre-filter: USD Red only
-        usd_red = [e for e in events if e.get("currency", "").upper() == "USD" and e.get("impact") == "red"]
-        if not usd_red:
-            log.info("No USD Red events today — skipping daily briefing.")
-            return ""
-        prompt = _BRIEFING_PROMPT_TEMPLATE.format(
-            events_json=json.dumps(usd_red, ensure_ascii=False, indent=2),
-            date_str=date_str,
+        # Pre-filter: TA / meme / opinion patterns
+        pat = _reject_pattern_hit(text)
+        if pat:
+            log.info(f"[PRE-FILTER] Reject pattern '{pat}' — instant reject.")
+            return _reject(f"TA/meme/opinion pattern: '{pat}'", "rejected_pattern")
+
+        prompt = self._build_moderation_prompt(text)
+
+        # Layer 1 — Gemini
+        try:
+            verdict = await asyncio.wait_for(
+                self._gemini_call(prompt, image_data, image_mime), timeout=40
+            )
+            verdict["engine"] = "gemini-2.5-flash"
+            log.info(f"Gemini → approved={verdict['approved']} | {verdict.get('reason', '')}")
+            if verdict.get("approved"):
+                verdict["formatted_text"] = _build_post_body(verdict["formatted_text"])
+            return verdict
+        except Exception as exc:
+            log.warning(f"Gemini failed ({exc}) — trying Groq …")
+
+        # Layer 2 — Groq fallback
+        try:
+            verdict = await asyncio.wait_for(
+                self._groq_call(prompt, image_data, image_mime), timeout=55
+            )
+            verdict["engine"] = "groq-llama4-scout"
+            log.info(f"Groq → approved={verdict['approved']} | {verdict.get('reason', '')}")
+            if verdict.get("approved"):
+                verdict["formatted_text"] = _build_post_body(verdict["formatted_text"])
+            return verdict
+        except Exception as exc:
+            log.error(f"Both engines failed — safe reject.")
+            return _reject("Both AI engines unavailable.", "engine_error", confidence=0.0)
+
+    # ── Similarity Check ─────────────────────────────────────────────────────
+    async def is_same_story(self, story_a: str, story_b: str) -> bool:
+        """
+        AI-powered duplicate detection — returns True if same underlying story.
+        Used in addition to hash check to catch same news worded differently.
+        """
+        if not story_a or not story_b:
+            return False
+        prompt = _SIMILARITY_PROMPT.format(
+            story_a=story_a[:500], story_b=story_b[:500]
         )
         try:
-            result = await asyncio.wait_for(self._gemini_text_call(prompt), timeout=45)
-            log.info("Daily briefing generated via Gemini.")
-            return _clean_output(result.strip())
+            loop = asyncio.get_event_loop()
+            resp = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None, lambda: self._gemini_vision.generate_content(prompt)
+                ),
+                timeout=20,
+            )
+            data = _parse_json(resp.text)
+            result = bool(data.get("same_story", False))
+            conf = data.get("confidence", 0)
+            log.info(f"Similarity check → same_story={result} | confidence={conf}")
+            return result and conf >= 0.80
         except Exception as exc:
-            log.warning(f"Gemini briefing failed ({exc}) — trying Groq …")
-        try:
-            result = await asyncio.wait_for(self._groq_text_call(prompt), timeout=60)
-            log.info("Daily briefing generated via Groq fallback.")
-            return _clean_output(result.strip())
-        except Exception as exc:
-            log.error(f"Both engines failed for briefing — using fallback formatter.")
-            return self._fallback_briefing(usd_red, date_str)
+            log.warning(f"Similarity check failed ({exc}) — assuming not duplicate.")
+            return False
 
+    # ── ForexFactory Image Analysis ───────────────────────────────────────────
+    async def analyse_ff_image(
+        self,
+        image_data: bytes,
+        image_mime: str,
+        today_date: str,
+        is_weekly: bool = False,
+        week_range: str = "",
+    ) -> dict:
+        """
+        Analyse a ForexFactory calendar image posted in source channel.
+        Returns dict with approved, formatted_text.
+        """
+        if is_weekly:
+            prompt = _FF_WEEKLY_IMAGE_PROMPT.format(week_range=week_range)
+        else:
+            prompt = _FF_IMAGE_PROMPT.format(today_date=today_date)
+
+        parts = [
+            {"inline_data": {"mime_type": image_mime, "data": _b64(image_data)}},
+            prompt,
+        ]
+
+        try:
+            loop = asyncio.get_event_loop()
+            resp = await asyncio.wait_for(
+                loop.run_in_executor(
+                    None, lambda: self._gemini_vision.generate_content(parts)
+                ),
+                timeout=45,
+            )
+            data = _parse_json(resp.text)
+            log.info(f"FF image analysis → approved={data.get('approved')} | {data.get('reason', '')}")
+            return data
+        except Exception as exc:
+            log.warning(f"Gemini FF image failed ({exc}) — trying Groq …")
+
+        # Groq fallback
+        try:
+            content = [
+                {"type": "image_url", "image_url": {"url": f"data:{image_mime};base64,{_b64(image_data)}"}},
+                {"type": "text", "text": prompt},
+            ]
+            resp = await asyncio.wait_for(
+                self._groq.chat.completions.create(
+                    model="meta-llama/llama-4-scout-17b-16e-instruct",
+                    messages=[{"role": "user", "content": content}],
+                    temperature=0.1,
+                    max_tokens=800,
+                ),
+                timeout=60,
+            )
+            data = _parse_json(resp.choices[0].message.content)
+            log.info(f"Groq FF image → approved={data.get('approved')}")
+            return data
+        except Exception as exc:
+            log.error(f"Both engines failed for FF image: {exc}")
+            return {"approved": False, "reason": "AI engines unavailable for image analysis."}
+
+    # ── 10-Minute Alert ───────────────────────────────────────────────────────
     async def generate_alert(self, event: dict, motivational_index: int = 0) -> str:
         impact_emoji = "🔴" if event.get("impact") == "red" else "🟠"
         motivational_line = _get_motivational_line(motivational_index)
-
-        forecast_raw = event.get("forecast", "").strip()
-        previous_raw = event.get("previous", "").strip()
-        has_forecast = bool(forecast_raw and forecast_raw != "—")
-        has_previous = bool(previous_raw and previous_raw != "—")
-        forecast_val = forecast_raw if has_forecast else ""
-        previous_val = previous_raw if has_previous else ""
 
         prompt = _ALERT_PROMPT_TEMPLATE.format(
             event_name=event.get("name", "Unknown Event"),
             currency=event.get("currency", "USD"),
             time_12h=event.get("time_12h", "—"),
-            forecast=forecast_val,
-            previous=previous_val,
-            has_forecast=has_forecast,
-            has_previous=has_previous,
-            impact=event.get("impact", "red"),
             impact_emoji=impact_emoji,
             motivational_line=motivational_line,
         )
         try:
             result = await asyncio.wait_for(self._gemini_text_call(prompt), timeout=30)
             log.info(f"Alert generated for: {event.get('name')}")
-            return _clean_output(result.strip())
+            return _add_signature(_strip_asterisks(result.strip()))
         except Exception as exc:
             log.warning(f"Gemini alert failed ({exc}) — trying Groq …")
         try:
             result = await asyncio.wait_for(self._groq_text_call(prompt), timeout=45)
-            return _clean_output(result.strip())
+            return _add_signature(_strip_asterisks(result.strip()))
         except Exception as exc:
             log.error(f"Both engines failed for alert — using fallback.")
             return self._fallback_alert(event, motivational_index)
 
-    async def generate_weekly_outlook(self, events: list, week_range: str) -> str:
-        if not events:
-            return ""
-        # Hard pre-filter: USD Red only
-        usd_red = [e for e in events if e.get("currency", "").upper() == "USD" and e.get("impact") == "red"]
-        if not usd_red:
-            log.info("No USD Red events this week — skipping weekly outlook.")
-            return ""
-        prompt = _WEEKLY_PROMPT_TEMPLATE.format(
-            events_json=json.dumps(usd_red, ensure_ascii=False, indent=2),
-            week_range=week_range,
-        )
-        try:
-            result = await asyncio.wait_for(self._gemini_text_call(prompt), timeout=60)
-            log.info("Weekly outlook generated via Gemini.")
-            return _clean_output(result.strip())
-        except Exception as exc:
-            log.warning(f"Gemini weekly failed ({exc}) — trying Groq …")
-        try:
-            result = await asyncio.wait_for(self._groq_text_call(prompt), timeout=75)
-            log.info("Weekly outlook generated via Groq fallback.")
-            return _clean_output(result.strip())
-        except Exception as exc:
-            log.error(f"Weekly outlook generation completely failed: {exc}")
-            return self._fallback_weekly(usd_red, week_range)
-
+    # ── Internal callers ──────────────────────────────────────────────────────
     def _build_moderation_prompt(self, text: str) -> str:
         return textwrap.dedent(f"""
             DATE (UTC): {_today_str()}
@@ -494,14 +543,12 @@ class AIEngine:
             \"\"\"
 
             TASK:
-            1. Check ALL rejection criteria first.
-            2. If image present: scan for watermarks or signals, check timestamps.
-            3. HARD RULE: Only approve USD + Red impact content. Reject ALL Orange and ALL non-USD.
-            4. If approved: lightly clean and format. English only. 60-120 words max.
-               Add a NOTE line. Use 12-hour AM/PM times.
-               DO NOT use asterisks or markdown bolding.
-               DO NOT write EAT, GMT+3, or Addis Ababa Time in output.
-            5. Return valid JSON only — no markdown fences — no trailing commas.
+            1. Check ALL rejection criteria (signals, TA, memes, charts, opinions, duplicates).
+            2. If image: check for watermarks, TA charts, memes — reject all of these.
+            3. If approved: clean and format. English only. 2-4 sentences max.
+               Hashtags: ONLY #XAUUSD #DXY #OIL — nothing else.
+               NO NOTE line. NO forecast. NO previous. NO asterisks.
+            4. Return valid JSON only — no markdown fences — no trailing commas.
         """).strip()
 
     async def _gemini_call(self, prompt: str, image_data: Optional[bytes], image_mime: str) -> dict:
@@ -521,19 +568,12 @@ class AIEngine:
     async def _groq_call(self, prompt: str, image_data: Optional[bytes], image_mime: str) -> dict:
         content = []
         if image_data:
-            content.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:{image_mime};base64,{_b64(image_data)}"},
-            })
+            content.append({"type": "image_url", "image_url": {"url": f"data:{image_mime};base64,{_b64(image_data)}"}})
         content.append({"type": "text", "text": prompt})
         resp = await self._groq.chat.completions.create(
             model="meta-llama/llama-4-scout-17b-16e-instruct",
-            messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user", "content": content},
-            ],
-            temperature=0.15,
-            max_tokens=500,
+            messages=[{"role": "system", "content": _SYSTEM_PROMPT}, {"role": "user", "content": content}],
+            temperature=0.15, max_tokens=600,
         )
         return _parse_json(resp.choices[0].message.content)
 
@@ -541,56 +581,56 @@ class AIEngine:
         resp = await self._groq.chat.completions.create(
             model="meta-llama/llama-4-scout-17b-16e-instruct",
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.2,
-            max_tokens=1200,
+            temperature=0.2, max_tokens=1200,
         )
         return resp.choices[0].message.content
 
-    @staticmethod
-    def _fallback_briefing(events: list, date_str: str) -> str:
-        lines = [f"📅 TODAY'S HIGH IMPACT NEWS\n{date_str}\n"]
-        for ev in events:
-            lines.append(
-                f"🔴 {ev.get('time_12h', '—')} | USD: {ev.get('name', 'Unknown')}\n"
-                f"• Forecast: {ev.get('forecast', '—')} | Previous: {ev.get('previous', '—')}"
-            )
-        lines.append("\n📌 NOTE: Monitor volatility closely during all USD releases.")
-        return "\n".join(lines)
-
+    # ── Fallback formatters ───────────────────────────────────────────────────
     @staticmethod
     def _fallback_alert(event: dict, motivational_index: int = 0) -> str:
+        emoji = "🔴" if event.get("impact") == "red" else "🟠"
         line = _get_motivational_line(motivational_index)
-        forecast_raw = event.get("forecast", "").strip()
-        previous_raw = event.get("previous", "").strip()
-        data_lines = ""
-        if forecast_raw and forecast_raw != "—":
-            data_lines += f"FORECAST: {forecast_raw}\n"
-        if previous_raw and previous_raw != "—":
-            data_lines += f"PREVIOUS: {previous_raw}\n"
-        return (
+        text = (
             f"🚨 ALERT: 10 MINUTES REMAINING\n\n"
-            f"EVENT: 🔴 {event.get('name', 'Unknown Event')}\n"
-            f"TIME: {event.get('time_12h', '—')}\n"
-            f"{data_lines}"
-            f"\nREQUIRED ACTION:\n"
+            f"NEWS: {emoji} {event.get('name', 'Unknown Event')}\n"
+            f"TIME: {event.get('time_12h', '—')}\n\n"
+            f"REQUIRED ACTION:\n"
             f"✅ Secure open profits now\n"
             f"✅ Move Stop-Loss to Break-even\n"
             f"✅ No new entries during the release\n\n"
             f"{line}"
         )
+        return _add_signature(text)
 
-    @staticmethod
-    def _fallback_weekly(events: list, week_range: str) -> str:
-        from itertools import groupby
-        lines = [f"📅 WEEKLY HIGH IMPACT OUTLOOK\nWeek of {week_range}\n"]
-        for day, day_events in groupby(events, key=lambda e: e.get("date", "Unknown")):
-            lines.append(f"\n{day}")
-            for ev in day_events:
-                lines.append(
-                    f"🔴 {ev.get('time_12h', '—')} | USD: {ev.get('name', 'Unknown')}\n"
-                    f"  ↳ Forecast: {ev.get('forecast', '—')} | Previous: {ev.get('previous', '—')}"
-                )
-        lines.append(
-            "\n📌 NOTE:\nMonitor all USD Red events closely. Manage risk carefully around high-impact releases."
-        )
-        return "\n".join(lines)
+
+# ── Module-level helpers ───────────────────────────────────────────────────────
+
+def _reject(reason: str, issue: str, confidence: float = 1.0) -> dict:
+    return {
+        "approved": False,
+        "reason": reason,
+        "issues": [issue],
+        "formatted_text": "",
+        "confidence": confidence,
+        "engine": "pre_filter",
+    }
+
+
+def _build_post_body(text: str) -> str:
+    """
+    Clean the AI output body:
+    - Remove all hashtags from body (we add fixed ones)
+    - Remove NOTE lines
+    - Strip asterisks
+    - Add fixed hashtags + signature
+    """
+    if not text:
+        return ""
+    text = text.replace("*", "")
+    text = re.sub(r"📌\s*(NOTE|MARKET STATUS|STATUS)[^\n]*\n?", "", text).strip()
+    text = re.sub(r"#\w+", "", text).strip()
+    # Add fixed hashtags
+    text = f"{text}\n\n{ALLOWED_HASHTAGS}"
+    # Add signature
+    text = _add_signature(text)
+    return text
