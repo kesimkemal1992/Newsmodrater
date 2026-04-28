@@ -1,7 +1,8 @@
-
 """
 ai_engine.py — Dual-layer AI analysis engine.
-Supports Trump/Hormuz/Oil supply news, adds US flag emoji, only #XAUUSD #DXY #OIL.
+
+No pre‑filters. AI decides everything.
+Adds US flag emoji. Only #XAUUSD #DXY #OIL hashtags.
 """
 
 import asyncio
@@ -11,7 +12,7 @@ import logging
 import re
 import textwrap
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Tuple
 
 import google.generativeai as genai
 from groq import AsyncGroq
@@ -23,32 +24,6 @@ CHANNEL_SIGNATURE = "\n\n[Squad 4xx](https://t.me/Squad_4xx)"
 # ─── Only three allowed hashtags ────────────────────────────────────────────
 ALLOWED_HASHTAGS = "#XAUUSD #DXY #OIL"
 
-# ─── Trump / market-moving keywords ─────────────────────────────────────────
-TRUMP_KEYWORDS = [
-    "trump", "donald trump", "president trump", "trump's", "trump tariff",
-    "trump speech", "trump rally", "trump announcement", "trump media",
-    "former president trump", "trump investigation", "trump indictment"
-]
-
-# Additional critical geopolitical triggers (Hormuz, oil supply, Iran, etc.)
-GEOPOLITICAL_TRIGGERS = [
-    "strait of hormuz", "hormuz strait", "oil supply disruption", "oil blockade",
-    "tanker attack", "middle east shipping lane", "iran collapse", "state of collapse",
-    "open the hormuz", "hormuz", "oil embargo", "oil production cut"
-]
-
-def _is_trump_or_market_moving(text: str) -> bool:
-    if not text:
-        return False
-    text_lower = text.lower()
-    for kw in TRUMP_KEYWORDS:
-        if kw in text_lower:
-            return True
-    for kw in GEOPOLITICAL_TRIGGERS:
-        if kw in text_lower:
-            return True
-    return False
-
 def _add_us_flag_emoji(text: str) -> str:
     """Add US flag emoji after first occurrence of US or USD in headline."""
     if not text:
@@ -56,25 +31,16 @@ def _add_us_flag_emoji(text: str) -> str:
     lines = text.split('\n')
     if not lines:
         return text
-    first_line = lines[0]  # headline
-    # Replace "US" or "USD" with "US 🇺🇸" or "USD 🇺🇸" (only once)
+    first_line = lines[0]
     new_line = re.sub(r'\bUS\b', 'US 🇺🇸', first_line, count=1)
     new_line = re.sub(r'\bUSD\b', 'USD 🇺🇸', new_line, count=1)
     lines[0] = new_line
     return '\n'.join(lines)
 
-# ─── System prompt (explicit approval for Hormuz/Trump) ─────────────────────
+# ─── System prompt – strict formatting, no pre‑filter instructions ──────────
 _SYSTEM_PROMPT = """
-You are AXIOM INTEL — a Senior Institutional Macro & Geopolitical news editor.
-
-CRITICAL RULE FOR ENERGY / STRAIT / TRUMP NEWS:
-- Any mention of "Strait of Hormuz", "Hormuz Strait", "oil supply disruption",
-  "oil blockade", "tanker attack", "Middle East shipping lane", "Iran collapse",
-  "state of collapse", "open the Hormuz" is ALWAYS market-moving.
-- Any statement from Donald Trump, Biden, or any world leader about Iran, Saudi Arabia,
-  Russia, or Venezuela affecting oil production or shipping must be APPROVED.
-- These are HIGH IMPACT geopolitical events even if the source is a social media post.
-- If it affects OIL supply, it affects GOLD and USD. Always approve unless stale (>18h).
+You are AXIOM INTEL — a Senior Institutional Macro & Geopolitical news editor
+for a professional Telegram trading channel. Your audience is experienced traders.
 
 YOUR ONLY JOB:
 Take the source content, verify its relevance, and format it cleanly.
@@ -99,11 +65,9 @@ REJECT IF ANY OF THESE APPLY:
 5. WATERMARK     — Another channel logo or username visible on image
 6. STALE         — Content older than 18 hours
 7. OFF-TOPIC     — Not about geopolitics, central banks, macro data,
-                   Gold, Oil, USD — strictly no other topics.
-                   But remember: Hormuz, oil supply, Trump statements are ON-TOPIC even if informal.
-8. LOW VALUE     — Vague, no specific real-world event.
-                   However, "Iran state of collapse" + "Open Hormuz" is specific and high value.
-9. DUPLICATE     — Same story already processed.
+                   Gold, Oil, USD — strictly no other topics
+8. LOW VALUE     — Vague, no specific real-world event
+9. DUPLICATE     — Same story already processed (even if worded differently)
 10. PREDICTION   — "I think", "expect", "my analysis", "in my opinion"
 11. COMMENTARY   — Personal views, market opinions, trade recommendations
 
@@ -131,23 +95,35 @@ RESPOND WITH VALID JSON ONLY — NO MARKDOWN FENCES — NO TRAILING COMMAS:
 {"approved": true, "reason": "brief reason", "issues": [], "formatted_text": "post text here without signature", "confidence": 0.9}
 """.strip()
 
-# ─── Similarity check (unchanged) ───────────────────────────────────────────
+# ─── Similarity check prompt (strengthened) ─────────────────────────────────
 _SIMILARITY_PROMPT = """
-You are a duplicate news detector.
-Compare these two news stories and decide if they are about the SAME real-world event.
-Ignore differences in wording, language, or phrasing — only judge the underlying story.
+You are a duplicate news detector for financial/geopolitical news.
+Compare the two stories below. If they describe the same real-world event,
+even if worded differently, in different languages, with different lengths,
+or with minor spelling mistakes, respond with same_story=true.
 
-Story A:
-{story_a}
+Story A: {story_a}
+Story B: {story_b}
 
-Story B:
-{story_b}
+Respond in JSON: {{"same_story": true/false, "confidence": 0.0-1.0, "reason": "..."}}
+"""
 
-Are these the same story? Respond with JSON only:
-{"same_story": true, "confidence": 0.95, "reason": "brief reason"}
-""".strip()
+# ─── Similarity for multimodal (text + image) ───────────────────────────────
+_MULTIMODAL_SIMILARITY_PROMPT = """
+You are a duplicate news detector. Compare the two news items below.
+Each contains text and possibly an image. Decide if they are the SAME real-world event.
 
-# ─── ForexFactory image prompts (unchanged) ──────────────────────────────────
+Item A text: {text_a}
+Item B text: {text_b}
+(Images are also compared visually if both exist)
+
+Pay attention: If the images show the same chart, same calendar page, same person, or same event scene,
+and the texts agree, then they are duplicates.
+
+Respond with JSON: {{"same_story": true, "confidence": 0.0-1.0, "reason": "..."}}
+"""
+
+# ─── ForexFactory image analysis prompts (unchanged) ─────────────────────────
 _FF_IMAGE_PROMPT = """
 You are analysing a ForexFactory economic calendar screenshot posted in a Telegram channel.
 
@@ -245,6 +221,7 @@ REQUIRED ACTION:
 Return ONLY the formatted alert. No JSON. No markdown. No asterisks.
 """.strip()
 
+# ─── Helper functions ────────────────────────────────────────────────────────
 def _b64(data: bytes) -> str:
     return base64.b64encode(data).decode()
 
@@ -257,7 +234,7 @@ def _add_signature(text: str) -> str:
         text += CHANNEL_SIGNATURE
     return text
 
-# ─── Motivational pool (unchanged) ──────────────────────────────────────────
+# Motivational pool
 _MOTIVATIONAL_POOL = [
     "🛡️ Guard your account like it is your last one — because one day, it might be. Stay safe. 🔒",
     "💰 Your account is everything. One reckless trade during news can erase weeks of hard work. 🚫",
@@ -283,31 +260,6 @@ _MOTIVATIONAL_POOL = [
 
 def _get_motivational_line(index: int = 0) -> str:
     return _MOTIVATIONAL_POOL[index % len(_MOTIVATIONAL_POOL)]
-
-_SIGNAL_RE = re.compile(
-    r"\b(buy|sell|long|short|entry|tp|take[\s_-]?profit|sl|stop[\s_-]?loss|"
-    r"stoploss|stop\s+at\s+\d|entry\s*[:\-]?\s*\d|target\s*[:\-]?\s*\d)\b",
-    re.IGNORECASE,
-)
-
-_REJECT_PATTERNS = re.compile(
-    r"\b(setup|trade idea|my plan|in my opinion|i think|i expect|prediction|"
-    r"analysis|meme|chart pattern|support|resistance|trendline|fibonacci|"
-    r"elliott wave|ichimoku|rsi|macd|bollinger|moving average)\b",
-    re.IGNORECASE,
-)
-
-def _signal_hit(text: str) -> Optional[str]:
-    if not text:
-        return None
-    m = _SIGNAL_RE.search(text)
-    return m.group(0).strip() if m else None
-
-def _reject_pattern_hit(text: str) -> Optional[str]:
-    if not text:
-        return None
-    m = _REJECT_PATTERNS.search(text)
-    return m.group(0).strip() if m else None
 
 def _parse_json(raw: str) -> dict:
     if not raw:
@@ -342,12 +294,13 @@ def _validate_and_clean(data: dict) -> dict:
         data["formatted_text"] = re.sub(
             r"📌\s*(NOTE|MARKET STATUS|STATUS)[^\n]*\n?", "", data["formatted_text"]
         ).strip()
-        # Remove any hashtags and re-add only allowed ones
+        # Remove any hashtags (AI might add extra ones)
         if data.get("approved"):
             text = data["formatted_text"]
             text = re.sub(r"#\w+", "", text).strip()
             data["formatted_text"] = text
 
+    # Hard reject if signal keyword still appears (safety net)
     if data.get("approved") and _signal_hit(data.get("formatted_text", "")):
         log.warning("Signal keyword in output — hard reject.")
         data["approved"] = False
@@ -357,9 +310,21 @@ def _validate_and_clean(data: dict) -> dict:
 
     return data
 
+def _signal_hit(text: str) -> Optional[str]:
+    if not text:
+        return None
+    _SIGNAL_RE = re.compile(
+        r"\b(buy|sell|long|short|entry|tp|take[\s_-]?profit|sl|stop[\s_-]?loss|"
+        r"stoploss|stop\s+at\s+\d|entry\s*[:\-]?\s*\d|target\s*[:\-]?\s*\d)\b",
+        re.IGNORECASE,
+    )
+    m = _SIGNAL_RE.search(text)
+    return m.group(0).strip() if m else None
+
 def _strip_asterisks(text: str) -> str:
     return text.replace("*", "") if text else text
 
+# ─── AIEngine class ──────────────────────────────────────────────────────────
 class AIEngine:
     def __init__(self, gemini_key: str, groq_key: str, channel_category: str):
         self._category = channel_category
@@ -391,30 +356,13 @@ class AIEngine:
             ),
         )
 
-    # ─── News moderation with Trump/geopolitical override ────────────────────
+    # ─── News moderation (no pre‑filters) ────────────────────────────────────
     async def analyse(
         self,
         text: str,
         image_data: Optional[bytes] = None,
         image_mime: str = "image/jpeg",
     ) -> dict:
-        # Trump / Hormuz / oil supply news bypass pre-filters
-        if _is_trump_or_market_moving(text):
-            log.info("[TRUMP/GEOPOLITICAL] Detected — bypassing standard pre-filters")
-            hit = _signal_hit(text)
-            if hit:
-                log.warning(f"Signal keyword '{hit}' found but geopolitical news overrides — AI will decide.")
-
-        if not _is_trump_or_market_moving(text):
-            hit = _signal_hit(text)
-            if hit:
-                log.info(f"[PRE-FILTER] Signal '{hit}' — instant reject.")
-                return _reject("Signal keyword detected.", "signal_content")
-            pat = _reject_pattern_hit(text)
-            if pat:
-                log.info(f"[PRE-FILTER] Reject pattern '{pat}' — instant reject.")
-                return _reject(f"TA/meme/opinion pattern: '{pat}'", "rejected_pattern")
-
         prompt = self._build_moderation_prompt(text)
 
         try:
@@ -423,9 +371,8 @@ class AIEngine:
             )
             verdict["engine"] = "gemini-2.5-flash"
             log.info(f"Gemini → approved={verdict['approved']} | {verdict.get('reason', '')}")
-            if verdict.get("approved"):
+            if verdict.get("approved") and verdict.get("formatted_text"):
                 verdict["formatted_text"] = _build_post_body(verdict["formatted_text"])
-                # Add US flag emoji if US or USD appears
                 verdict["formatted_text"] = _add_us_flag_emoji(verdict["formatted_text"])
             return verdict
         except Exception as exc:
@@ -437,7 +384,7 @@ class AIEngine:
             )
             verdict["engine"] = "groq-llama4-scout"
             log.info(f"Groq → approved={verdict['approved']} | {verdict.get('reason', '')}")
-            if verdict.get("approved"):
+            if verdict.get("approved") and verdict.get("formatted_text"):
                 verdict["formatted_text"] = _build_post_body(verdict["formatted_text"])
                 verdict["formatted_text"] = _add_us_flag_emoji(verdict["formatted_text"])
             return verdict
@@ -445,25 +392,67 @@ class AIEngine:
             log.error(f"Both engines failed — safe reject.")
             return _reject("Both AI engines unavailable.", "engine_error", confidence=0.0)
 
-    async def is_same_story(self, story_a: str, story_b: str) -> bool:
-        if not story_a or not story_b:
-            return False
-        prompt = _SIMILARITY_PROMPT.format(story_a=story_a[:500], story_b=story_b[:500])
-        try:
-            loop = asyncio.get_event_loop()
-            resp = await asyncio.wait_for(
-                loop.run_in_executor(None, lambda: self._gemini_vision.generate_content(prompt)), timeout=20
-            )
-            data = _parse_json(resp.text)
-            result = bool(data.get("same_story", False))
-            conf = data.get("confidence", 0)
-            log.info(f"Similarity check → same_story={result} | confidence={conf}")
-            return result and conf >= 0.80
-        except Exception as exc:
-            log.warning(f"Similarity check failed ({exc}) — assuming not duplicate.")
+    # ─── Similarity check (supports text + optional images) ──────────────────
+    async def is_same_story(
+        self,
+        text_a: str,
+        text_b: str,
+        image_a: Optional[bytes] = None,
+        image_b: Optional[bytes] = None,
+    ) -> bool:
+        """Compare two stories (text + optional images). Returns True if duplicate."""
+        if not text_a and not text_b and not image_a and not image_b:
             return False
 
-    async def analyse_ff_image(self, image_data: bytes, image_mime: str, today_date: str, is_weekly: bool = False, week_range: str = "") -> dict:
+        # Fast path: if both have images, compute perceptual hash externally
+        # (the caller already does that; here we rely on AI for semantic match)
+
+        # Build prompt
+        if image_a or image_b:
+            prompt = _MULTIMODAL_SIMILARITY_PROMPT.format(
+                text_a=(text_a[:400] if text_a else "(no text)"),
+                text_b=(text_b[:400] if text_b else "(no text)"),
+            )
+        else:
+            prompt = _SIMILARITY_PROMPT.format(
+                story_a=(text_a[:500] if text_a else ""),
+                story_b=(text_b[:500] if text_b else ""),
+            )
+
+        # Call AI (Gemini vision because it can handle images if needed)
+        try:
+            # If images are provided, we send them to the vision model
+            parts = []
+            if image_a:
+                parts.append({"inline_data": {"mime_type": "image/jpeg", "data": _b64(image_a)}})
+            if image_b:
+                parts.append({"inline_data": {"mime_type": "image/jpeg", "data": _b64(image_b)}})
+            parts.append(prompt)
+
+            loop = asyncio.get_event_loop()
+            resp = await asyncio.wait_for(
+                loop.run_in_executor(None, lambda: self._gemini_vision.generate_content(parts)),
+                timeout=20,
+            )
+            data = _parse_json(resp.text)
+            same = bool(data.get("same_story", False))
+            conf = data.get("confidence", 0)
+            log.info(f"Similarity → same={same} | conf={conf}")
+            # Lowered threshold to 0.65 for catching reworded stories
+            return same and conf >= 0.65
+        except Exception as exc:
+            log.warning(f"Similarity check failed: {exc} — assuming not duplicate.")
+            return False
+
+    # ─── ForexFactory image analysis ─────────────────────────────────────────
+    async def analyse_ff_image(
+        self,
+        image_data: bytes,
+        image_mime: str,
+        today_date: str,
+        is_weekly: bool = False,
+        week_range: str = "",
+    ) -> dict:
         if is_weekly:
             prompt = _FF_WEEKLY_IMAGE_PROMPT.format(week_range=week_range)
         else:
@@ -473,17 +462,17 @@ class AIEngine:
             loop = asyncio.get_event_loop()
             resp = await asyncio.wait_for(loop.run_in_executor(None, lambda: self._gemini_vision.generate_content(parts)), timeout=45)
             data = _parse_json(resp.text)
-            log.info(f"FF image analysis → approved={data.get('approved')} | {data.get('reason', '')}")
+            log.info(f"FF image → approved={data.get('approved')} | {data.get('reason', '')}")
             if data.get("approved") and data.get("formatted_text"):
                 data["formatted_text"] = _add_us_flag_emoji(data["formatted_text"])
             return data
         except Exception as exc:
-            log.warning(f"Gemini FF image failed ({exc}) — trying Groq …")
+            log.warning(f"Gemini FF failed ({exc}) — trying Groq …")
         try:
             content = [{"type": "image_url", "image_url": {"url": f"data:{image_mime};base64,{_b64(image_data)}"}}, {"type": "text", "text": prompt}]
             resp = await asyncio.wait_for(self._groq.chat.completions.create(model="meta-llama/llama-4-scout-17b-16e-instruct", messages=[{"role": "user", "content": content}], temperature=0.1, max_tokens=800), timeout=60)
             data = _parse_json(resp.choices[0].message.content)
-            log.info(f"Groq FF image → approved={data.get('approved')}")
+            log.info(f"Groq FF → approved={data.get('approved')}")
             if data.get("approved") and data.get("formatted_text"):
                 data["formatted_text"] = _add_us_flag_emoji(data["formatted_text"])
             return data
@@ -491,6 +480,7 @@ class AIEngine:
             log.error(f"Both engines failed for FF image: {exc}")
             return {"approved": False, "reason": "AI engines unavailable for image analysis."}
 
+    # ─── 10-minute alert generation ─────────────────────────────────────────
     async def generate_alert(self, event: dict, motivational_index: int = 0) -> str:
         impact_emoji = "🔴" if event.get("impact") == "red" else "🟠"
         motivational_line = _get_motivational_line(motivational_index)
@@ -516,6 +506,7 @@ class AIEngine:
             log.error(f"Both engines failed for alert — using fallback.")
             return self._fallback_alert(event, motivational_index)
 
+    # ─── Internal helpers ────────────────────────────────────────────────────
     def _build_moderation_prompt(self, text: str) -> str:
         return textwrap.dedent(f"""
             DATE (UTC): {_today_str()}
@@ -527,13 +518,10 @@ class AIEngine:
             \"\"\"
 
             TASK:
-            1. Check ALL rejection criteria (signals, TA, memes, charts, opinions, duplicates).
-               But remember: Hormuz, oil supply, Iran collapse, Trump statements are ALWAYS on-topic and high impact.
-            2. If image: check for watermarks, TA charts, memes — reject all of these.
-            3. If approved: clean and format. English only. 2-4 sentences max.
-               Hashtags: ONLY #XAUUSD #DXY #OIL — no other hashtags.
-               NO NOTE line. NO forecast. NO previous. NO asterisks.
-            4. Return valid JSON only — no markdown fences — no trailing commas.
+            Analyze the content. If it is relevant geopolitical/macro news (Gold, Oil, USD, central banks,
+            geopolitics, energy security, political leaders affecting markets, etc.) then approve and format.
+            If it is signal, TA, meme, off-topic, low-value, or stale, reject.
+            Format according to the rules. Return JSON.
         """).strip()
 
     async def _gemini_call(self, prompt: str, image_data: Optional[bytes], image_mime: str) -> dict:
@@ -587,6 +575,7 @@ class AIEngine:
         text = _add_us_flag_emoji(text)
         return _add_signature(text)
 
+# ─── Module‑level helpers ────────────────────────────────────────────────────
 def _reject(reason: str, issue: str, confidence: float = 1.0) -> dict:
     return {
         "approved": False,
@@ -602,6 +591,7 @@ def _build_post_body(text: str) -> str:
         return ""
     text = text.replace("*", "")
     text = re.sub(r"📌\s*(NOTE|MARKET STATUS|STATUS)[^\n]*\n?", "", text).strip()
+    # Remove any hashtags (AI might add extra ones)
     text = re.sub(r"#\w+", "", text).strip()
     text = f"{text}\n\n{ALLOWED_HASHTAGS}"
     text = _add_signature(text)
