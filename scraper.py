@@ -9,22 +9,25 @@ Rules:
       (max 1 per day — any channel posts it, first one wins)
   • Weekly FF image posted Sunday → weekly calendar post
   • 10-min reminders for USD/Gold/FOMC red events (max 2/day)
-  • Double protection: hash check + AI similarity check
+  • Double protection: hash check + perceptual image hash + AI similarity
   • No forecast, no previous, no NOTE line anywhere
   • Every post ends with [Squad 4xx](https://t.me/Squad_4xx)
-  • Times: 12-hour AM/PM EAT 
+  • Times: 12-hour AM/PM EAT
 """
 
 import asyncio
+import hashlib
 import io
 import json
 import logging
 import mimetypes
 import random
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List, Tuple
 
 import pytz
+from PIL import Image
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument
@@ -39,7 +42,6 @@ EAT = pytz.timezone("Africa/Addis_Ababa")
 _IMG_MIMES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
 
 # ── ForexFactory detection keywords ──────────────────────────────────────────
-# If a posted image caption contains these → treat as FF calendar image
 _FF_CAPTION_KEYWORDS = (
     "forexfactory", "forex factory", "calendar", "economic calendar",
     "high impact", "impact news", "weekly news", "today news",
@@ -64,19 +66,15 @@ _FOMC_KEYWORDS = (
 
 _GOLD_KEYWORDS = ("gold", "xau")
 
-
 def _is_fomc_event(name: str) -> bool:
     n = name.lower()
     return any(kw in n for kw in _FOMC_KEYWORDS)
 
-
 def _is_reminder_eligible(event: dict) -> bool:
     if event.get("impact") != "red":
         return False
-    # FOMC/Federal — no data required
     if _is_fomc_event(event.get("name", "")):
         return True
-    # USD or Gold — needs real forecast + previous
     currency = event.get("currency", "").upper().strip()
     name_lower = event.get("name", "").lower()
     is_usd = currency == "USD"
@@ -90,11 +88,9 @@ def _is_reminder_eligible(event: dict) -> bool:
         previous and previous != "—"
     )
 
-
 def _is_priority_event(name: str) -> bool:
     n = name.lower()
     return any(kw in n for kw in _PRIORITY_KEYWORDS)
-
 
 def _is_image(msg) -> bool:
     if isinstance(msg.media, MessageMediaPhoto):
@@ -105,39 +101,74 @@ def _is_image(msg) -> bool:
             return True
     return False
 
-
 def _doc_mime(msg) -> str:
     if isinstance(msg.media, MessageMediaDocument):
         return msg.media.document.mime_type or "image/jpeg"
     return "image/jpeg"
 
-
 def _eat_now() -> datetime:
     return datetime.now(EAT)
-
 
 def _eat_today_str() -> str:
     return _eat_now().strftime("%Y-%m-%d")
 
-
 def _eat_today_display() -> str:
     return _eat_now().strftime("%A, %B %d, %Y")
 
-
 def _looks_like_ff_image(text: str) -> bool:
-    """Check if caption text suggests this is a ForexFactory calendar image."""
     if not text:
         return False
     t = text.lower()
     return any(kw in t for kw in _FF_CAPTION_KEYWORDS)
 
-
 def _looks_like_weekly(text: str) -> bool:
-    """Check if caption suggests this is a weekly calendar image."""
     if not text:
         return False
     t = text.lower()
     return any(kw in t for kw in ("week", "weekly", "this week", "next week"))
+
+# ─── Perceptual image hash (for fast duplicate detection) ─────────────────────
+def _compute_perceptual_hash(image_data: bytes) -> str:
+    """Return a simple perceptual hash (8x8 average hash) as hex string."""
+    try:
+        img = Image.open(io.BytesIO(image_data))
+        # Convert to grayscale and resize to 8x8
+        img = img.convert('L').resize((8, 8), Image.Resampling.LANCZOS)
+        pixels = list(img.getdata())
+        avg = sum(pixels) / len(pixels)
+        bits = ''.join('1' if p > avg else '0' for p in pixels)
+        # Return SHA256 of the bitstring to keep fixed length
+        return hashlib.sha256(bits.encode()).hexdigest()[:16]
+    except Exception:
+        # Fallback: use first 1024 bytes of image
+        return hashlib.sha256(image_data[:1024]).hexdigest()[:16]
+
+def _extract_events_from_ff_text(text: str) -> List[dict]:
+    """Extract events from AI-generated FF briefing text."""
+    events = []
+    pattern = re.compile(
+        r"(🔴|🟠)\s+(\d{1,2}:\d{2}\s+[AP]M)\s*\|\s*([A-Z]{3}):\s*(.+)"
+    )
+    for line in text.splitlines():
+        m = pattern.search(line)
+        if m:
+            emoji, time_12h, currency, name = m.groups()
+            impact = "red" if emoji == "🔴" else "orange"
+            try:
+                dt = datetime.strptime(time_12h.strip(), "%I:%M %p")
+                time_24h = dt.strftime("%H:%M")
+            except ValueError:
+                time_24h = ""
+            events.append({
+                "name": name.strip(),
+                "currency": currency.strip(),
+                "impact": impact,
+                "time_12h": time_12h.strip(),
+                "time_24h": time_24h,
+                "forecast": "—",
+                "previous": "—",
+            })
+    return events
 
 
 class ChannelScraper:
@@ -146,7 +177,6 @@ class ChannelScraper:
         self._ai = ai_engine
         self._mem = memory
 
-        # ── Destination channels ──────────────────────────────────────────────
         self._dest_channels: List[str] = config.get("dest_channels", [])
         if not self._dest_channels:
             single = config.get("dest_channel", "")
@@ -162,10 +192,8 @@ class ChannelScraper:
         self._max_delay = config["max_delay_seconds"]
         self._lookback_hours = config["lookback_hours"]
 
-        # In-memory reminder state
         self._todays_vip_events: List[dict] = []
 
-        # ── Telegram session ──────────────────────────────────────────────────
         session_string = config.get("session_string", "").strip()
         if session_string:
             session = StringSession(session_string)
@@ -268,8 +296,8 @@ class ChannelScraper:
                 await asyncio.sleep(fwe.seconds + 3)
                 try:
                     sent = await self._client.send_message(dest, text, parse_mode="md")
-                except Exception as exc:
-                    log.error(f"Retry failed for {dest}: {exc}")
+                except Exception:
+                    pass
             except Exception as exc:
                 log.error(f"Send error on {dest}: {exc}", exc_info=True)
             await asyncio.sleep(1)
@@ -338,11 +366,12 @@ class ChannelScraper:
             await asyncio.sleep(random.uniform(2, 6))
         await self._mem.set_last_msg_id(channel, new_last_id)
 
-    # ── Per-message handler ───────────────────────────────────────────────────
+    # ── Per-message handler (with enhanced duplicate detection) ───────────────
     async def _handle_message(self, msg, source_channel: str):
         text = msg.text or msg.message or ""
         image_data: Optional[bytes] = None
         image_mime = "image/jpeg"
+        perceptual_hash: Optional[str] = None
 
         if msg.media and _is_image(msg):
             try:
@@ -350,28 +379,38 @@ class ChannelScraper:
                 await self._client.download_media(msg.media, file=buf)
                 image_data = buf.getvalue()
                 image_mime = _doc_mime(msg)
-                log.debug(f"Image: {len(image_data):,} bytes | mime={image_mime}")
+                perceptual_hash = _compute_perceptual_hash(image_data)
+                log.debug(f"Image: {len(image_data):,} bytes | mime={image_mime} | phash={perceptual_hash}")
             except Exception as exc:
                 log.warning(f"Image download failed: {exc}")
 
-        # ── Route: ForexFactory calendar image ────────────────────────────────
+        # ── Route: ForexFactory calendar image (no duplicate check yet, handled separately) ──
         if image_data and (_looks_like_ff_image(text) or await self._image_looks_like_ff(image_data, image_mime)):
             is_weekly = _looks_like_weekly(text)
             await self._handle_ff_image(image_data, image_mime, text, is_weekly, source_channel, msg.id)
             return
 
-        # ── Route: Regular news moderation ────────────────────────────────────
+        # ── Route: Regular news with strong duplicate detection ───────────────
         content_hash = self._mem.hash_combined(text, image_data)
 
-        # Layer 1: Hash duplicate check
+        # Layer 1: Exact hash duplicate
         if await self._mem.is_duplicate(content_hash):
             log.info(f"[SKIP] Hash duplicate — {content_hash[:12]}…")
             return
 
-        # Layer 2: AI similarity check against recent posts
-        if text and await self._is_similar_to_recent(text):
+        # Layer 2: Perceptual image duplicate (fast)
+        if perceptual_hash and await self._mem.is_image_duplicate(perceptual_hash):
+            log.info(f"[SKIP] Duplicate image (perceptual hash) — {perceptual_hash}")
+            await self._mem.mark_image_seen(perceptual_hash, source_channel)
+            return
+
+        # Layer 3: AI similarity against recent posts (text + image)
+        if await self._is_similar_to_recent(text, image_data, perceptual_hash):
             log.info(f"[SKIP] AI similarity — same story already posted.")
+            # Mark as seen to avoid future hash duplicates
             await self._mem.mark_seen(content_hash, source=source_channel)
+            if perceptual_hash:
+                await self._mem.mark_image_seen(perceptual_hash, source_channel)
             return
 
         log.info(
@@ -380,12 +419,11 @@ class ChannelScraper:
         )
         verdict = await self._ai.analyse(text, image_data, image_mime)
         await self._mem.mark_seen(content_hash, source=source_channel)
+        if perceptual_hash:
+            await self._mem.mark_image_seen(perceptual_hash, source_channel)
 
         if not verdict.get("approved"):
-            log.info(
-                f"[REJECTED] reason='{verdict.get('reason')}' | "
-                f"issues={verdict.get('issues')}"
-            )
+            log.info(f"[REJECTED] reason='{verdict.get('reason')}' | issues={verdict.get('issues')}")
             return
 
         post_text = verdict.get("formatted_text", "").strip()
@@ -409,11 +447,15 @@ class ChannelScraper:
             ai_verdict=verdict,
             formatted_text=post_text,
         )
-        # Store for future similarity checks
-        await self._mem.store_recent_post_text(text, post_text)
+        # Store for future similarity checks (with image hash)
+        await self._mem.store_recent_post(
+            source_text=text[:1000],
+            post_text=post_text[:1000],
+            image_hash=perceptual_hash,
+        )
         log.info(f"✅  Posted → msg_id={sent.id} | confidence={verdict.get('confidence')}")
 
-    # ── ForexFactory image handler ────────────────────────────────────────────
+    # ── ForexFactory calendar image handler (unchanged logic) ─────────────────
     async def _handle_ff_image(
         self,
         image_data: bytes,
@@ -427,7 +469,6 @@ class ChannelScraper:
         today_display = _eat_today_display()
 
         if is_weekly:
-            # Weekly FF image
             now = _eat_now()
             week_start = now + timedelta(days=(7 - now.weekday()))
             week_end = week_start + timedelta(days=4)
@@ -461,7 +502,6 @@ class ChannelScraper:
                 log.info(f"📆  Weekly calendar posted → msg_id={sent.id}")
 
         else:
-            # Daily FF image — max 1 per day
             if await self._mem.has_daily_briefing(today_str):
                 log.info(f"[SKIP] Daily briefing already posted today ({today_str}).")
                 return
@@ -482,9 +522,7 @@ class ChannelScraper:
                 return
 
             post_text = _add_signature(post_text)
-
-            # Extract events for reminders from the formatted text
-            events = _parse_events_from_ff_text(post_text)
+            events = _extract_events_from_ff_text(post_text)
             self._todays_vip_events = self._select_vip_events(events)
             log.info(f"VIP reminder slots: {[e.get('name') for e in self._todays_vip_events]}")
 
@@ -494,11 +532,6 @@ class ChannelScraper:
                 log.info(f"📅  Daily briefing posted → msg_id={sent.id}")
 
     async def _image_looks_like_ff(self, image_data: bytes, image_mime: str) -> bool:
-        """
-        Quick AI check if an image without caption is a ForexFactory calendar.
-        Only called when caption doesn't already hint at FF.
-        Returns False on any failure to avoid false positives.
-        """
         try:
             prompt = (
                 "Is this image a ForexFactory.com economic calendar screenshot? "
@@ -521,16 +554,28 @@ class ChannelScraper:
         except Exception:
             return False
 
-    # ── AI similarity duplicate check ─────────────────────────────────────────
-    async def _is_similar_to_recent(self, new_text: str) -> bool:
-        """
-        Check new_text against recent posted stories using AI similarity.
-        Only checks last 20 recent posts stored in memory.
-        """
+    # ── AI similarity check against recent posts (enhanced) ───────────────────
+    async def _is_similar_to_recent(self, new_text: str, new_image: Optional[bytes], new_phash: Optional[str] = None) -> bool:
+        """Check if new content (text+image) matches any recent post via AI."""
         try:
-            recent_texts = await self._mem.get_recent_post_texts(limit=20)
-            for old_text in recent_texts:
-                if await self._ai.is_same_story(new_text, old_text):
+            recent = await self._mem.get_recent_posts(limit=30)
+            for old_text, old_phash in recent:
+                # Fast perceptual hash match
+                if new_phash and old_phash and new_phash == old_phash:
+                    log.info(f"Image hash match with recent post")
+                    return True
+                # AI semantic comparison (text only or multimodal if both have images)
+                if not old_text:
+                    continue
+                # We don't have old image bytes, so we compare text and rely on AI's judgment
+                # (store image bytes is too heavy; perceptual hash already caught exact matches)
+                same = await self._ai.is_same_story(
+                    text_a=new_text[:500],
+                    text_b=old_text[:500],
+                    image_a=new_image,
+                    image_b=None,   # no old image bytes
+                )
+                if same:
                     return True
         except Exception as exc:
             log.warning(f"Similarity check error: {exc}")
@@ -540,29 +585,22 @@ class ChannelScraper:
     def _select_vip_events(self, events: List[dict]) -> List[dict]:
         eligible = [e for e in events if _is_reminder_eligible(e)]
         if not eligible:
-            log.info("No reminder-eligible events today.")
             return []
-
         def sort_key(e):
             return (0 if _is_priority_event(e.get("name", "")) else 1, e.get("time_24h", "99:99"))
-
         vip = sorted(eligible, key=sort_key)[:2]
-        log.info(f"Top 2 VIP: {[e.get('name') for e in vip]}")
         return vip
 
     # ── Reminder scheduler ────────────────────────────────────────────────────
     async def _check_reminders(self):
         today_str = _eat_today_str()
-
         reminder_count = await self._mem.get_reminder_count_today(today_str)
         if reminder_count >= 2:
             return
-
         briefing_msg_id = await self._mem.get_daily_briefing_msg_id(today_str)
         if not briefing_msg_id or briefing_msg_id == -1:
             return
 
-        # Recover VIP list after restart
         vip_events = self._todays_vip_events
         if not vip_events:
             try:
@@ -586,11 +624,9 @@ class ChannelScraper:
         for event in vip_events:
             if slots_left <= 0:
                 break
-
             event_key = f"{today_str}_{event.get('name', '')}_{event.get('currency', '')}"
             if await self._mem.has_reminder_been_sent(event_key):
                 continue
-
             event_time_str = event.get("time_24h", "")
             if not event_time_str:
                 continue
@@ -600,9 +636,7 @@ class ChannelScraper:
                 )
             except ValueError:
                 continue
-
             minutes_until = (event_time - now_naive).total_seconds() / 60
-
             if 8 <= minutes_until <= 12:
                 await self._send_reminder(event, event_key, briefing_msg_id, today_str)
                 slots_left -= 1
@@ -621,7 +655,6 @@ class ChannelScraper:
         if not alert_text:
             log.error(f"Failed to generate alert for {event.get('name')}")
             return
-
         for dest in self._dest_channels:
             try:
                 sent = await self._client.send_message(
@@ -632,7 +665,6 @@ class ChannelScraper:
             except Exception as exc:
                 log.error(f"Reminder send failed to {dest}: {exc}", exc_info=True)
             await asyncio.sleep(1)
-
         await self._mem.mark_reminder_sent(event_key)
         await self._mem.increment_reminder_count(today_str)
 
@@ -646,7 +678,6 @@ class ChannelScraper:
             except Exception:
                 pass
 
-    # ── Reminder dispatcher loop (called from main.py) ────────────────────────
     async def reminder_dispatcher_loop(self):
         log.info("🔔  Reminder dispatcher running …")
         while True:
@@ -655,41 +686,3 @@ class ChannelScraper:
             except Exception as exc:
                 log.error(f"Reminder dispatcher error: {exc}", exc_info=True)
             await asyncio.sleep(60)
-
-
-# ── Utility: parse events from FF formatted text ──────────────────────────────
-def _parse_events_from_ff_text(text: str) -> List[dict]:
-    """
-    Extract basic event list from the AI-generated FF briefing text.
-    Used to build VIP reminder list after FF image is processed.
-    Pattern: 🔴 03:30 PM | USD: Non-Farm Payrolls
-    """
-    events = []
-    pattern = re.compile(
-        r"(🔴|🟠)\s+(\d{1,2}:\d{2}\s+[AP]M)\s*\|\s*([A-Z]{3}):\s*(.+)"
-    )
-    import re
-    for line in text.splitlines():
-        m = pattern.search(line)
-        if m:
-            emoji, time_12h, currency, name = m.groups()
-            impact = "red" if emoji == "🔴" else "orange"
-            # Convert 12h to 24h for reminder timing
-            try:
-                dt = datetime.strptime(time_12h.strip(), "%I:%M %p")
-                time_24h = dt.strftime("%H:%M")
-            except ValueError:
-                time_24h = ""
-            events.append({
-                "name": name.strip(),
-                "currency": currency.strip(),
-                "impact": impact,
-                "time_12h": time_12h.strip(),
-                "time_24h": time_24h,
-                "forecast": "—",
-                "previous": "—",
-            })
-    return events
-
-
-import re
