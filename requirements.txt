@@ -10,4 +10,4 @@ pytz==2024.1
 requests==2.31.0
 PySocks==1.7.1
 aiohttp==3.9.3
-pip install imagehash
+imagehash==4.3.1
