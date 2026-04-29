@@ -1,6 +1,6 @@
 """
 scraper.py — AXIOM INTEL channel scraper and forwarder.
-Hardened duplicate protection for calendar images (phash distance ≤3).
+Hardened duplicate protection: image phash (Hamming ≤3) + event name matching + AI similarity.
 """
 
 import asyncio
@@ -49,6 +49,13 @@ _FOMC_KEYWORDS = (
 )
 
 _GOLD_KEYWORDS = ("gold", "xau")
+
+# Critical event names that should never be posted twice on the same day
+_UNIQUE_EVENT_NAMES = [
+    "federal funds rate", "fomc", "interest rate decision",
+    "non-farm payroll", "nfp", "consumer price index", "cpi",
+    "pce", "gdp", "fed chair", "powell speaks"
+]
 
 def _is_fomc_event(name: str) -> bool:
     n = name.lower()
@@ -355,7 +362,7 @@ class ChannelScraper:
             return
 
         if await self._is_similar_to_recent(text, image_data, phash):
-            log.info(f"[SKIP] AI similarity — same story already posted.")
+            log.info(f"[SKIP] Duplicate detected (event name match or AI similarity).")
             await self._mem.mark_seen(content_hash, source=source_channel)
             if phash:
                 await self._mem.mark_image_seen(phash, source_channel)
@@ -389,15 +396,25 @@ class ChannelScraper:
         log.info(f"✅ Posted → msg_id={sent.id} | confidence={verdict.get('confidence')}")
 
     async def _is_similar_to_recent(self, new_text: str, new_image: Optional[bytes], new_phash: Optional[str] = None) -> bool:
+        """Check if new content is a duplicate of any recent post using: phash, event names, AI similarity."""
         try:
             recent = await self._mem.get_recent_posts(limit=150)
             for old_text, old_phash in recent:
+                # 1) Fast image phash match
                 if new_phash and old_phash:
                     distance = self._mem.hamming_distance(new_phash, old_phash)
                     if distance <= 3:
                         log.info(f"Phash match: distance={distance}")
                         return True
+                # 2) Event name matching for critical releases (FOMC, NFP, CPI, etc.)
                 if old_text and new_text:
+                    new_lower = new_text.lower()
+                    old_lower = old_text.lower()
+                    for name in _UNIQUE_EVENT_NAMES:
+                        if name in new_lower and name in old_lower:
+                            log.info(f"Matched critical event name '{name}' – preventing duplicate")
+                            return True
+                    # 3) AI semantic comparison (for other stories)
                     same = await self._ai.is_same_story(
                         text_a=new_text[:500],
                         text_b=old_text[:500],
@@ -419,6 +436,15 @@ class ChannelScraper:
         if phash and await self._mem.is_image_duplicate(phash, max_distance=3):
             log.info(f"[SKIP] FF image duplicate (phash distance ≤3) — {phash}")
             return
+
+        # Also check if today’s events have already been posted as a text summary
+        # This prevents duplicate FOMC/NFP/etc. events between text and calendar
+        if not is_weekly:
+            # Run the event name match against recent posts
+            dummy_text = f"FOMC {today_display}"  # minimal text to trigger the match
+            if await self._is_similar_to_recent(dummy_text, None, None):
+                log.info(f"[SKIP] FF image – event names already covered by recent text post.")
+                return
 
         if is_weekly:
             now = _eat_now()
