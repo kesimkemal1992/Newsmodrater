@@ -1,6 +1,6 @@
 """
 ai_engine.py — Dual-layer AI analysis engine.
-Includes geopolitical exception, Groq fallback, and trailing year removal.
+Geopolitical exception, Groq fallback, trailing year removal.
 """
 
 import asyncio
@@ -33,88 +33,69 @@ def _add_us_flag_emoji(text: str) -> str:
     return '\n'.join(lines)
 
 _SYSTEM_PROMPT = """
-You are AXIOM INTEL — a Senior Institutional Macro & Geopolitical news editor
-for a professional Telegram trading channel. Your audience is experienced traders.
+You are AXIOM INTEL — a Senior Institutional Macro & Geopolitical news editor.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 🔥 GEOPOLITICAL EXCEPTION (ALWAYS APPROVE)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Any statement from a world leader (e.g., Trump, Biden, Putin, Xi, etc.) that affects:
+Any statement from a world leader (e.g., Trump, Biden, Putin, Xi) that affects:
 - Oil supply (Hormuz, OPEC, embargo, sanctions)
 - War / conflict escalation
 - Tariffs / trade restrictions
 - Central bank or financial policy changes
 - Gold, USD, or energy markets
-
 These are HIGH IMPACT geopolitical events, even if posted on social media.
-Do NOT reject them as "opinion" or "commentary" or "low value".
-Format them as news using emoji 🗳️ or 🌍 or 🚨.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 YOUR ONLY JOB:
 Take the source content, verify its relevance, and format it cleanly.
 Do NOT speculate. Do NOT add analysis beyond the facts.
-Do NOT change the meaning. Format it professionally and precisely.
+Do NOT change the meaning.
 
 CRITICAL FORMATTING RULES:
-- DO NOT use asterisks (*) or any markdown bolding anywhere
+- DO NOT use asterisks (*) or any markdown bolding
 - Use ONLY plain text and emojis
-- NO NOTE line. NO MARKET STATUS line. NO commentary line at the end.
-- NO forecast, NO previous data — never include numbers or data tables
-- Hashtags: ONLY #XAUUSD #DXY #OIL — no other hashtags ever
-- Do NOT add the current year at the end of the post.
-- Do NOT add signature — it is added automatically after
+- NO NOTE line. NO MARKET STATUS. NO commentary line.
+- NO forecast, NO previous data — never include numbers
+- Hashtags: ONLY #XAUUSD #DXY #OIL — no other hashtags
+- Do NOT add the current year at the end.
+- Do NOT add signature (added automatically)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-REJECT IF ANY OF THESE APPLY (EXCEPT the Geopolitical Exception above):
+REJECT IF ANY OF THESE APPLY (EXCEPT the Geopolitical Exception):
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-1. SIGNALS       — Buy / Sell / Long / Short / Entry / TP / SL / price targets
-2. CHART / TA    — Technical analysis, chart patterns, indicators, setups
-3. MEME          — Meme images, jokes, informal content, opinion posts
-4. ANALYSIS IMG  — Chart screenshots, TA images, trade idea images
-5. WATERMARK     — Another channel logo or username visible on image
+1. SIGNALS       — Buy/Sell/Long/Short/Entry/TP/SL/price targets
+2. CHART / TA    — Technical analysis, patterns, indicators
+3. MEME          — Memes, jokes, informal content
+4. ANALYSIS IMG  — Chart screenshots, TA images
+5. WATERMARK     — Another channel logo or username
 6. STALE         — Content older than 18 hours
-7. OFF-TOPIC     — Not about geopolitics, central banks, macro data,
-                   Gold, Oil, USD — strictly no other topics.
-                   (Exception: Trump/Iran/war/tariff posts are ON-TOPIC.)
-8. LOW VALUE     — Vague, no specific real-world event.
-                   (Exception: A direct statement from a leader about a specific action is NOT low value.)
-9. DUPLICATE     — Same story already processed (even if worded differently)
-10. PREDICTION   — "I think", "expect", "my analysis", "in my opinion"
-11. COMMENTARY   — Personal views, market opinions, trade recommendations.
-    (Exception: When the personal view IS the news, e.g., "Trump says Iran collapsed" – this is newsworthy.)
+7. OFF-TOPIC     — Not about geopolitics, central banks, macro data, Gold, Oil, USD
+8. LOW VALUE     — Vague, no specific real-world event
+9. DUPLICATE     — Same story already processed
+10. PREDICTION   — "I think", "expect", "my analysis"
+11. COMMENTARY   — Personal views, market opinions
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-FORMAT (if approved — geopolitical/macro news only):
+FORMAT (if approved):
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+[EMOJI] [SHORT ENGLISH HEADLINE — one line, factual]
 
-[EMOJI] [SHORT ENGLISH HEADLINE — one line, factual and direct]
-
-[Source content lightly cleaned. English only. 2-4 sentences max.
-Plain facts only. No bold. No asterisks. Do not add anything new.]
+[Source content lightly cleaned. 2-4 sentences max. Plain facts only.]
 
 #XAUUSD #DXY #OIL
 
-EMOJI — pick ONE that matches the story:
-  🚨 Breaking news     🌍 Geopolitics / war / sanctions
-  📊 Economic data     🏦 Central bank decision
-  🛢️ Oil/energy        🏆 Gold/commodities
-  💵 USD/FX flows      ⚠️ Risk event / crisis
-  🗳️ Political leader / Trump / major election event
+EMOJI: 🚨 🌍 📊 🏦 🛢️ 🏆 💵 ⚠️ 🗳️
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 RESPOND WITH VALID JSON ONLY — NO MARKDOWN FENCES — NO TRAILING COMMAS:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-{"approved": true, "reason": "brief reason", "issues": [], "formatted_text": "post text here without signature", "confidence": 0.9}
+{"approved": true, "reason": "brief reason", "issues": [], "formatted_text": "...", "confidence": 0.9}
 """.strip()
 
 _SIMILARITY_PROMPT = """
-You are a duplicate news detector for financial/geopolitical news.
-Compare the two stories below. If they describe the same real-world event,
-even if worded differently, in different languages, with different lengths,
-or with minor spelling mistakes, respond with same_story=true.
-
-IMPORTANT: Be aggressive. If there is any reasonable chance they are the same event, mark same_story=true.
+You are a duplicate news detector. Compare the two stories. If they describe the same real-world event – even if worded differently, in different languages, or with minor spelling mistakes – respond with same_story=true.
+Be aggressive. If any reasonable chance they are the same, mark true.
 
 Story A: {story_a}
 Story B: {story_b}
@@ -123,15 +104,11 @@ Respond in JSON: {{"same_story": true/false, "confidence": 0.0-1.0, "reason": ".
 """
 
 _MULTIMODAL_SIMILARITY_PROMPT = """
-You are a duplicate news detector. Compare the two news items below.
-Each contains text and possibly an image. Decide if they are the SAME real-world event.
+You are a duplicate news detector. Compare the two items (text + optional images). Decide if they are the SAME real-world event.
 
 Item A text: {text_a}
 Item B text: {text_b}
-(Images are also compared visually if both exist)
-
-Pay attention: If the images show the same chart, same calendar page, same person, or same event scene,
-and the texts agree, then they are duplicates.
+(Images are compared visually if both exist)
 
 Be aggressive: if there is any reasonable chance they are the same, mark same_story=true.
 
@@ -139,74 +116,57 @@ Respond with JSON: {{"same_story": true, "confidence": 0.0-1.0, "reason": "..."}
 """
 
 _FF_IMAGE_PROMPT = """
-You are analysing a ForexFactory economic calendar screenshot posted in a Telegram channel.
+You are analysing a ForexFactory economic calendar screenshot.
 
 TODAY'S DATE: {today_date}
 
-YOUR TASKS:
-1. Confirm this is a real ForexFactory calendar image (not a meme, chart, or other image)
-2. Confirm it shows TODAY's date ({today_date}) — reject if it shows another date
-3. Extract only USD high-impact (Red) and medium-impact (Orange) events visible
-4. Format a clean daily briefing — NO forecast, NO previous data
+TASKS:
+1. Confirm this is a real ForexFactory calendar image (not meme/chart)
+2. Confirm it shows TODAY's date – reject otherwise
+3. Extract only USD high-impact (Red) and medium-impact (Orange) events
+4. Format a clean daily briefing – NO forecast, NO previous data
 
 STRICT RULES:
 - Only USD events
-- Only Red (🔴) and Orange (🟠) impact
-- Times in 12-hour AM/PM format only (no timezone label)
+- Only 🔴 and 🟠 impact
+- Times in 12-hour AM/PM only (no timezone)
 - NO forecast values, NO previous values
 - NO NOTE line, NO commentary
 - Plain text only, no asterisks, no bold
 - Do NOT add signature
 
-If this is NOT a ForexFactory calendar image, or NOT today's date, respond with:
+If not a valid FF image or not today's date, respond:
 {{"approved": false, "reason": "not a valid ForexFactory today image"}}
 
-If valid, respond with:
+If valid:
 {{"approved": true, "reason": "valid FF today image", "formatted_text": "📅 TODAY'S USD HIGH IMPACT NEWS\\nDay, Month DD, YYYY\\n\\n🔴 03:30 PM | USD: Event Name\\n🟠 05:00 PM | USD: Another Event\\n\\nBe careful during these releases."}}
-
-RESPOND WITH VALID JSON ONLY — NO MARKDOWN FENCES — NO TRAILING COMMAS.
-""".strip()
+RESPOND WITH VALID JSON ONLY.
+"""
 
 _FF_WEEKLY_IMAGE_PROMPT = """
-You are analysing a ForexFactory economic calendar screenshot for the weekly outlook.
+You are analysing a ForexFactory calendar for the weekly outlook.
 
 CURRENT WEEK: {week_range}
 
-YOUR TASKS:
-1. Confirm this is a real ForexFactory calendar image
-2. Extract USD high-impact (Red) and medium-impact (Orange) events for this week
-3. Format a clean weekly calendar — NO forecast, NO previous data
+Extract USD high-impact (Red) and medium-impact (Orange) events for this week.
+Group by day. Times 12-hour AM/PM. NO forecast/previous. Plain text.
 
-STRICT RULES:
-- Only USD events
-- Only Red (🔴) and Orange (🟠) impact
-- Times in 12-hour AM/PM format only (no timezone label)
-- Group by day
-- NO forecast values, NO previous values
-- NO NOTE line, NO commentary
-- Plain text only, no asterisks, no bold
-- Do NOT add signature
-
-If NOT a valid ForexFactory image, respond with:
-{{"approved": false, "reason": "not a valid ForexFactory calendar image"}}
-
-If valid, respond with JSON containing formatted_text like:
-{{"approved": true, "reason": "valid FF weekly image", "formatted_text": "📅 WEEKLY HIGH IMPACT NEWS\\nWeek of {week_range}\\n\\nMonday — Apr 28\\n🔴 03:30 PM | USD: Event Name\\n\\nFriday — May 02\\n🔴 03:30 PM | USD: NFP"}}
-
-RESPOND WITH VALID JSON ONLY — NO MARKDOWN FENCES — NO TRAILING COMMAS.
-""".strip()
+If valid respond:
+{{"approved": true, "reason": "valid FF weekly image", "formatted_text": "📅 WEEKLY HIGH IMPACT NEWS\\nWeek of {week_range}\\n\\nMonday — Apr 28\\n🔴 03:30 PM | USD: Event Name\\n..."}}
+Otherwise {{"approved": false, "reason": "..."}}
+"""
 
 _ALERT_PROMPT_TEMPLATE = """
 You are a Senior Institutional Trader writing a pre-event warning alert.
 
 STRICT RULES:
-- DO NOT use asterisks (*) or any markdown bolding — plain text only
+- NO asterisks or markdown – plain text only
 - English only
 - Say NEWS: not EVENT:
-- Do NOT include Forecast or Previous — skip those lines entirely
+- Do NOT include Forecast or Previous
 - Do NOT add NOTE or commentary
 - Do NOT add signature
-- Copy the motivational closing line exactly as given — do not modify it
+- Copy the motivational closing line exactly
 
 News details:
 Name: {event_name}
@@ -217,7 +177,7 @@ Impact: {impact_emoji}
 Motivational closing line (copy exactly):
 {motivational_line}
 
-Write in this EXACT format:
+Write EXACT format:
 
 🚨 ALERT: 10 MINUTES REMAINING
 
@@ -231,10 +191,9 @@ REQUIRED ACTION:
 
 {motivational_line}
 
-Return ONLY the formatted alert. No JSON. No markdown. No asterisks.
-""".strip()
+Return ONLY the formatted alert. No JSON. No markdown.
+"""
 
-# ─── Helper functions ────────────────────────────────────────────────────────
 def _b64(data: bytes) -> str:
     return base64.b64encode(data).decode()
 
@@ -249,7 +208,7 @@ def _add_signature(text: str) -> str:
 
 _MOTIVATIONAL_POOL = [
     "🛡️ Guard your account like it is your last one — because one day, it might be. Stay safe. 🔒",
-    "💰 Your account is everything. One reckless trade during news can erase weeks of hard work. 🚫",
+    "💰 Your account is everything. One reckless trade during news can erase weeks of work. 🚫",
     "🔒 Do not risk more than you can afford to lose right now. Protect your balance first. 💡",
     "⚠️ Be careful — this is a high-risk moment. Reduce your size or stay out completely. 🛑",
     "🧘 Calm traders keep their accounts. Emotional traders lose them. Breathe and be careful. 💎",
@@ -303,13 +262,9 @@ def _validate_and_clean(data: dict) -> dict:
 
     if data.get("formatted_text"):
         data["formatted_text"] = data["formatted_text"].replace("*", "")
-        data["formatted_text"] = re.sub(
-            r"📌\s*(NOTE|MARKET STATUS|STATUS)[^\n]*\n?", "", data["formatted_text"]
-        ).strip()
+        data["formatted_text"] = re.sub(r"📌\s*(NOTE|MARKET STATUS|STATUS)[^\n]*\n?", "", data["formatted_text"]).strip()
         if data.get("approved"):
-            text = data["formatted_text"]
-            text = re.sub(r"#\w+", "", text).strip()
-            data["formatted_text"] = text
+            data["formatted_text"] = re.sub(r"#\w+", "", data["formatted_text"]).strip()
 
     if data.get("approved") and _signal_hit(data.get("formatted_text", "")):
         log.warning("Signal keyword in output — hard reject.")
@@ -343,9 +298,7 @@ class AIEngine:
         self._gemini = genai.GenerativeModel(
             model_name="gemini-2.5-flash",
             system_instruction=_SYSTEM_PROMPT,
-            generation_config=genai.GenerationConfig(
-                temperature=0.15, max_output_tokens=600, response_mime_type="application/json"
-            ),
+            generation_config=genai.GenerationConfig(temperature=0.15, max_output_tokens=600, response_mime_type="application/json"),
         )
         self._gemini_text = genai.GenerativeModel(
             model_name="gemini-2.5-flash",
@@ -353,9 +306,7 @@ class AIEngine:
         )
         self._gemini_vision = genai.GenerativeModel(
             model_name="gemini-2.5-flash",
-            generation_config=genai.GenerationConfig(
-                temperature=0.1, max_output_tokens=800, response_mime_type="application/json"
-            ),
+            generation_config=genai.GenerationConfig(temperature=0.1, max_output_tokens=800, response_mime_type="application/json"),
         )
 
     async def analyse(self, text: str, image_data: Optional[bytes] = None, image_mime: str = "image/jpeg") -> dict:
@@ -382,13 +333,7 @@ class AIEngine:
             log.error(f"Both engines failed — safe reject.")
             return _reject("Both AI engines unavailable.", "engine_error", confidence=0.0)
 
-    async def is_same_story(
-        self,
-        text_a: str,
-        text_b: str,
-        image_a: Optional[bytes] = None,
-        image_b: Optional[bytes] = None,
-    ) -> bool:
+    async def is_same_story(self, text_a: str, text_b: str, image_a: Optional[bytes] = None, image_b: Optional[bytes] = None) -> bool:
         if not text_a and not text_b and not image_a and not image_b:
             return False
         if image_a or image_b:
@@ -401,7 +346,6 @@ class AIEngine:
                 story_a=(text_a[:500] if text_a else ""),
                 story_b=(text_b[:500] if text_b else ""),
             )
-        # Try Gemini first
         try:
             parts = []
             if image_a:
@@ -410,9 +354,7 @@ class AIEngine:
                 parts.append({"inline_data": {"mime_type": "image/jpeg", "data": _b64(image_b)}})
             parts.append(prompt)
             loop = asyncio.get_event_loop()
-            resp = await asyncio.wait_for(
-                loop.run_in_executor(None, lambda: self._gemini_vision.generate_content(parts)), timeout=20
-            )
+            resp = await asyncio.wait_for(loop.run_in_executor(None, lambda: self._gemini_vision.generate_content(parts)), timeout=20)
             data = _parse_json(resp.text)
             same = bool(data.get("same_story", False))
             conf = data.get("confidence", 0)
@@ -420,7 +362,6 @@ class AIEngine:
             return same and conf >= 0.55
         except Exception as exc:
             log.warning(f"Gemini similarity failed ({exc}) — trying Groq …")
-        # Fallback to Groq
         try:
             content = []
             if image_a:
@@ -515,17 +456,11 @@ class AIEngine:
         return textwrap.dedent(f"""
             DATE (UTC): {_today_str()}
             CHANNEL FOCUS: {self._category}
-
             SOURCE CONTENT:
             \"\"\"
             {text.strip() if text else "(image only — no text)"}
             \"\"\"
-
-            TASK:
-            Analyze the content. If it is relevant geopolitical/macro news (Gold, Oil, USD, central banks,
-            geopolitics, energy security, political leaders affecting markets, etc.) then approve and format.
-            If it is signal, TA, meme, off-topic, low-value, or stale, reject.
-            Format according to the rules. Return JSON.
+            TASK: Analyse content. If it is relevant geopolitical/macro news (Gold, Oil, USD, central banks, geopolitics, energy, political leaders) approve and format. If signal, TA, meme, off‑topic, low‑value, stale – reject. Format according to rules. Return JSON.
         """).strip()
 
     async def _gemini_call(self, prompt: str, image_data: Optional[bytes], image_mime: str) -> dict:
@@ -594,10 +529,8 @@ def _build_post_body(text: str) -> str:
         return ""
     text = text.replace("*", "")
     text = re.sub(r"📌\s*(NOTE|MARKET STATUS|STATUS)[^\n]*\n?", "", text).strip()
-    # Remove any hashtags (AI might add extra ones)
     text = re.sub(r"#\w+", "", text).strip()
     text = f"{text}\n\n{ALLOWED_HASHTAGS}"
     text = _add_signature(text)
-    # Remove any stray 4-digit year at the very end (e.g., "2026")
     text = re.sub(r'\s+(\d{4})$', '', text.strip())
     return text
