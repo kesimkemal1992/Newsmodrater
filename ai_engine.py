@@ -1,6 +1,7 @@
 """
 ai_engine.py — Dual-layer AI analysis engine.
-Geopolitical exception, Groq fallback, trailing year removal.
+Geopolitical exception, Groq fallback, trailing year removal,
+ForexFactory prompts: USD only, GMT+3, 12-hour AM/PM, no forecast/previous.
 """
 
 import asyncio
@@ -115,46 +116,53 @@ Be aggressive: if there is any reasonable chance they are the same, mark same_st
 Respond with JSON: {{"same_story": true, "confidence": 0.0-1.0, "reason": "..."}}
 """
 
+# ─── FOREXFACTORY PROMPTS (FORCE GMT+3 / EAT, 12‑HOUR AM/PM, USD ONLY, NO FORECAST) ─────
 _FF_IMAGE_PROMPT = """
-You are analysing a ForexFactory economic calendar screenshot.
+You are analysing a ForexFactory economic calendar screenshot.  
+The channel’s audience is in **Ethiopia (GMT+3 / EAT)**. All times must be shown in **GMT+3** (EAT) and in **12‑hour AM/PM** format.
 
 TODAY'S DATE: {today_date}
 
 TASKS:
-1. Confirm this is a real ForexFactory calendar image (not meme/chart)
-2. Confirm it shows TODAY's date – reject otherwise
-3. Extract only USD high-impact (Red) and medium-impact (Orange) events
-4. Format a clean daily briefing – NO forecast, NO previous data
+1. Confirm this is a real ForexFactory calendar image (not meme/chart).
+2. Confirm it shows TODAY's date – reject otherwise.
+3. Extract **only USD high‑impact (Red 🔴) and medium‑impact (Orange 🟠) events** visible.
+4. **Convert all event times to GMT+3 (EAT)** – add the correct offset.
+5. Format a clean daily briefing – **NO forecast, NO previous data**.
 
 STRICT RULES:
-- Only USD events
-- Only 🔴 and 🟠 impact
-- Times in 12-hour AM/PM only (no timezone)
-- NO forecast values, NO previous values
-- NO NOTE line, NO commentary
-- Plain text only, no asterisks, no bold
-- Do NOT add signature
+- Only USD events (currency = USD).
+- Only 🔴 and 🟠 impact.
+- Times in 12‑hour AM/PM, no timezone label.
+- NO forecast values, NO previous values.
+- NO NOTE line, NO commentary.
+- Plain text only, no asterisks, no bold.
+- Do NOT add signature.
 
-If not a valid FF image or not today's date, respond:
+If not a valid FF image or not today's date:
 {{"approved": false, "reason": "not a valid ForexFactory today image"}}
 
-If valid:
+If valid, respond with JSON like:
 {{"approved": true, "reason": "valid FF today image", "formatted_text": "📅 TODAY'S USD HIGH IMPACT NEWS\\nDay, Month DD, YYYY\\n\\n🔴 03:30 PM | USD: Event Name\\n🟠 05:00 PM | USD: Another Event\\n\\nBe careful during these releases."}}
-RESPOND WITH VALID JSON ONLY.
-"""
+RESPOND WITH VALID JSON ONLY – NO MARKDOWN FENCES – NO TRAILING COMMAS.
+""".strip()
 
 _FF_WEEKLY_IMAGE_PROMPT = """
-You are analysing a ForexFactory calendar for the weekly outlook.
+You are analysing a ForexFactory calendar for the weekly outlook.  
+All times must be in **GMT+3 (EAT)** and **12‑hour AM/PM**.  
+Only USD high‑impact (🔴) and medium‑impact (🟠) events.
 
 CURRENT WEEK: {week_range}
 
-Extract USD high-impact (Red) and medium-impact (Orange) events for this week.
-Group by day. Times 12-hour AM/PM. NO forecast/previous. Plain text.
+Extract events, convert times to GMT+3, group by day.  
+NO forecast, NO previous data.  
+Plain text, no asterisks, no bold. Do not add signature.
 
-If valid respond:
+If valid:
 {{"approved": true, "reason": "valid FF weekly image", "formatted_text": "📅 WEEKLY HIGH IMPACT NEWS\\nWeek of {week_range}\\n\\nMonday — Apr 28\\n🔴 03:30 PM | USD: Event Name\\n..."}}
 Otherwise {{"approved": false, "reason": "..."}}
-"""
+RESPOND WITH VALID JSON ONLY.
+""".strip()
 
 _ALERT_PROMPT_TEMPLATE = """
 You are a Senior Institutional Trader writing a pre-event warning alert.
@@ -532,5 +540,10 @@ def _build_post_body(text: str) -> str:
     text = re.sub(r"#\w+", "", text).strip()
     text = f"{text}\n\n{ALLOWED_HASHTAGS}"
     text = _add_signature(text)
-    text = re.sub(r'\s+(\d{4})$', '', text.strip())
+    # Remove any standalone 4-digit year from last 3 lines
+    lines = text.split('\n')
+    for i in range(max(0, len(lines)-3), len(lines)):
+        lines[i] = re.sub(r'\b\d{4}\b', '', lines[i])
+    text = '\n'.join(lines)
+    text = re.sub(r'\n\s*\n', '\n\n', text).strip()
     return text
