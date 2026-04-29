@@ -1,6 +1,7 @@
+
 """
 scraper.py — AXIOM INTEL channel scraper and forwarder.
-Hardened duplicate protection: image phash (Hamming ≤3) + event name matching + AI similarity.
+Hardened duplicate protection, max 1 reminder per day.
 """
 
 import asyncio
@@ -50,7 +51,6 @@ _FOMC_KEYWORDS = (
 
 _GOLD_KEYWORDS = ("gold", "xau")
 
-# Critical event names that should never be posted twice on the same day
 _UNIQUE_EVENT_NAMES = [
     "federal funds rate", "fomc", "interest rate decision",
     "non-farm payroll", "nfp", "consumer price index", "cpi",
@@ -74,6 +74,7 @@ def _is_reminder_eligible(event: dict) -> bool:
         return False
     forecast = event.get("forecast", "").strip()
     previous = event.get("previous", "").strip()
+    # For USD/Gold events, require both forecast and previous to be non-empty.
     return bool(forecast and forecast != "—" and previous and previous != "—")
 
 def _is_priority_event(name: str) -> bool:
@@ -396,17 +397,14 @@ class ChannelScraper:
         log.info(f"✅ Posted → msg_id={sent.id} | confidence={verdict.get('confidence')}")
 
     async def _is_similar_to_recent(self, new_text: str, new_image: Optional[bytes], new_phash: Optional[str] = None) -> bool:
-        """Check if new content is a duplicate of any recent post using: phash, event names, AI similarity."""
         try:
             recent = await self._mem.get_recent_posts(limit=150)
             for old_text, old_phash in recent:
-                # 1) Fast image phash match
                 if new_phash and old_phash:
                     distance = self._mem.hamming_distance(new_phash, old_phash)
                     if distance <= 3:
                         log.info(f"Phash match: distance={distance}")
                         return True
-                # 2) Event name matching for critical releases (FOMC, NFP, CPI, etc.)
                 if old_text and new_text:
                     new_lower = new_text.lower()
                     old_lower = old_text.lower()
@@ -414,7 +412,6 @@ class ChannelScraper:
                         if name in new_lower and name in old_lower:
                             log.info(f"Matched critical event name '{name}' – preventing duplicate")
                             return True
-                    # 3) AI semantic comparison (for other stories)
                     same = await self._ai.is_same_story(
                         text_a=new_text[:500],
                         text_b=old_text[:500],
@@ -437,11 +434,8 @@ class ChannelScraper:
             log.info(f"[SKIP] FF image duplicate (phash distance ≤3) — {phash}")
             return
 
-        # Also check if today’s events have already been posted as a text summary
-        # This prevents duplicate FOMC/NFP/etc. events between text and calendar
         if not is_weekly:
-            # Run the event name match against recent posts
-            dummy_text = f"FOMC {today_display}"  # minimal text to trigger the match
+            dummy_text = f"FOMC {today_display}"
             if await self._is_similar_to_recent(dummy_text, None, None):
                 log.info(f"[SKIP] FF image – event names already covered by recent text post.")
                 return
@@ -519,14 +513,15 @@ class ChannelScraper:
             return []
         def sort_key(e):
             return (0 if _is_priority_event(e.get("name", "")) else 1, e.get("time_24h", "99:99"))
-        vip = sorted(eligible, key=sort_key)[:2]
+        vip = sorted(eligible, key=sort_key)[:2]  # limited to 2, but we will only send at most 1 per day
         log.info(f"Top 2 VIP: {[e.get('name') for e in vip]}")
         return vip
 
     async def _check_reminders(self):
         today_str = _eat_today_str()
         reminder_count = await self._mem.get_reminder_count_today(today_str)
-        if reminder_count >= 2:
+        log.info(f"Reminder status: {reminder_count}/1 sent today. Remaining slots: {1 - reminder_count}")
+        if reminder_count >= 1:   # Only ONE reminder per day
             return
         briefing_msg_id = await self._mem.get_daily_briefing_msg_id(today_str)
         if not briefing_msg_id or briefing_msg_id == -1:
@@ -546,7 +541,7 @@ class ChannelScraper:
                 return
         now = _eat_now()
         now_naive = now.replace(tzinfo=None)
-        slots_left = 2 - reminder_count
+        slots_left = 1 - reminder_count
         for event in vip_events:
             if slots_left <= 0:
                 break
@@ -561,13 +556,14 @@ class ChannelScraper:
             except ValueError:
                 continue
             minutes_until = (event_time - now_naive).total_seconds() / 60
+            log.info(f"⏰ Pre-reminder: {event.get('name')} at {event.get('time_12h')} - {minutes_until:.0f} minutes from now")
             if 8 <= minutes_until <= 12:
                 await self._send_reminder(event, event_key, briefing_msg_id, today_str)
                 slots_left -= 1
                 await asyncio.sleep(2)
 
     async def _send_reminder(self, event: dict, event_key: str, reply_to_msg_id: int, today_str: str):
-        log.info(f"⏰ Sending 10-min reminder: {event.get('name')}")
+        log.info(f"⏰ Sending 10-min reminder for {event.get('name')} at {event.get('time_12h')}")
         mot_index = await self._mem.get_and_increment_motivational_index()
         alert_text = await self._ai.generate_alert(event, motivational_index=mot_index)
         if not alert_text:
@@ -583,6 +579,8 @@ class ChannelScraper:
             await asyncio.sleep(1)
         await self._mem.mark_reminder_sent(event_key)
         await self._mem.increment_reminder_count(today_str)
+        new_count = await self._mem.get_reminder_count_today(today_str)
+        log.info(f"Reminder sent. Daily total now: {new_count}/1")
 
     async def _simulate_typing(self, text_len: int):
         duration = min(max(text_len / 180, 2), 14)
