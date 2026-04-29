@@ -1,6 +1,6 @@
 """
 ai_engine.py — Dual-layer AI analysis engine.
-Maximum duplicate protection with aggressive similarity threshold (0.55).
+Includes geopolitical exception for world leaders' statements (Trump, war, tariffs, oil disruption).
 """
 
 import asyncio
@@ -35,11 +35,26 @@ def _add_us_flag_emoji(text: str) -> str:
     lines[0] = new_line
     return '\n'.join(lines)
 
-# ─── System prompt (unchanged from original, full version) ──────────────────
+# ─── System prompt with geopolitical exception (Trump / war / tariffs) ────────
 _SYSTEM_PROMPT = """
 You are AXIOM INTEL — a Senior Institutional Macro & Geopolitical news editor
 for a professional Telegram trading channel. Your audience is experienced traders.
 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔥 GEOPOLITICAL EXCEPTION (ALWAYS APPROVE)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Any statement from a world leader (e.g., Trump, Biden, Putin, Xi, etc.) that affects:
+- Oil supply (Hormuz, OPEC, embargo, sanctions)
+- War / conflict escalation
+- Tariffs / trade restrictions
+- Central bank or financial policy changes
+- Gold, USD, or energy markets
+
+These are HIGH IMPACT geopolitical events, even if posted on social media.
+Do NOT reject them as "opinion" or "commentary" or "low value".
+Format them as news using emoji 🗳️ or 🌍 or 🚨.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 YOUR ONLY JOB:
 Take the source content, verify its relevance, and format it cleanly.
 Do NOT speculate. Do NOT add analysis beyond the facts.
@@ -54,7 +69,7 @@ CRITICAL FORMATTING RULES:
 - Do NOT add signature — it is added automatically after
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-REJECT IF ANY OF THESE APPLY:
+REJECT IF ANY OF THESE APPLY (EXCEPT the Geopolitical Exception above):
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 1. SIGNALS       — Buy / Sell / Long / Short / Entry / TP / SL / price targets
 2. CHART / TA    — Technical analysis, chart patterns, indicators, setups
@@ -63,11 +78,14 @@ REJECT IF ANY OF THESE APPLY:
 5. WATERMARK     — Another channel logo or username visible on image
 6. STALE         — Content older than 18 hours
 7. OFF-TOPIC     — Not about geopolitics, central banks, macro data,
-                   Gold, Oil, USD — strictly no other topics
-8. LOW VALUE     — Vague, no specific real-world event
+                   Gold, Oil, USD — strictly no other topics.
+                   (Exception: Trump/Iran/war/tariff posts are ON-TOPIC.)
+8. LOW VALUE     — Vague, no specific real-world event.
+                   (Exception: A direct statement from a leader about a specific action is NOT low value.)
 9. DUPLICATE     — Same story already processed (even if worded differently)
 10. PREDICTION   — "I think", "expect", "my analysis", "in my opinion"
-11. COMMENTARY   — Personal views, market opinions, trade recommendations
+11. COMMENTARY   — Personal views, market opinions, trade recommendations.
+    (Exception: When the personal view IS the news, e.g., "Trump says Iran collapsed" – this is newsworthy.)
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 FORMAT (if approved — geopolitical/macro news only):
@@ -183,7 +201,7 @@ If valid, respond with JSON containing formatted_text like:
 RESPOND WITH VALID JSON ONLY — NO MARKDOWN FENCES — NO TRAILING COMMAS.
 """.strip()
 
-# ─── 10-Minute Alert (unchanged) ────────────────────────────────────────────
+# ─── 10-Minute Alert ────────────────────────────────────────────────────────
 _ALERT_PROMPT_TEMPLATE = """
 You are a Senior Institutional Trader writing a pre-event warning alert.
 
@@ -295,13 +313,11 @@ def _validate_and_clean(data: dict) -> dict:
         data["formatted_text"] = re.sub(
             r"📌\s*(NOTE|MARKET STATUS|STATUS)[^\n]*\n?", "", data["formatted_text"]
         ).strip()
-        # Remove any hashtags (AI might add extra ones)
         if data.get("approved"):
             text = data["formatted_text"]
             text = re.sub(r"#\w+", "", text).strip()
             data["formatted_text"] = text
 
-    # Hard reject if signal keyword still appears (safety net)
     if data.get("approved") and _signal_hit(data.get("formatted_text", "")):
         log.warning("Signal keyword in output — hard reject.")
         data["approved"] = False
@@ -357,7 +373,7 @@ class AIEngine:
             ),
         )
 
-    # ─── News moderation (no pre‑filters) ────────────────────────────────────
+    # ─── News moderation ──────────────────────────────────────────────────────
     async def analyse(
         self,
         text: str,
@@ -401,7 +417,6 @@ class AIEngine:
         image_a: Optional[bytes] = None,
         image_b: Optional[bytes] = None,
     ) -> bool:
-        """Compare two stories (text + optional images). Returns True if same."""
         if not text_a and not text_b and not image_a and not image_b:
             return False
 
@@ -433,7 +448,6 @@ class AIEngine:
             same = bool(data.get("same_story", False))
             conf = data.get("confidence", 0)
             log.info(f"Similarity → same={same} | conf={conf}")
-            # Aggressive threshold (0.55) catches more duplicates
             return same and conf >= 0.55
         except Exception as exc:
             log.warning(f"Similarity check failed: {exc} — assuming not duplicate.")
@@ -517,7 +531,7 @@ class AIEngine:
             log.error(f"Both engines failed for alert — using fallback.")
             return self._fallback_alert(event, motivational_index)
 
-    # ─── Internal helpers ────────────────────────────────────────────────────
+    # ─── Internal methods ────────────────────────────────────────────────────
     def _build_moderation_prompt(self, text: str) -> str:
         return textwrap.dedent(f"""
             DATE (UTC): {_today_str()}
@@ -586,7 +600,8 @@ class AIEngine:
         text = _add_us_flag_emoji(text)
         return _add_signature(text)
 
-# ─── Module‑level helpers (outside class) ────────────────────────────────────
+
+# ─── Module‑level helpers ────────────────────────────────────────────────────
 def _reject(reason: str, issue: str, confidence: float = 1.0) -> dict:
     return {
         "approved": False,
@@ -602,7 +617,6 @@ def _build_post_body(text: str) -> str:
         return ""
     text = text.replace("*", "")
     text = re.sub(r"📌\s*(NOTE|MARKET STATUS|STATUS)[^\n]*\n?", "", text).strip()
-    # Remove any hashtags (AI might add extra ones)
     text = re.sub(r"#\w+", "", text).strip()
     text = f"{text}\n\n{ALLOWED_HASHTAGS}"
     text = _add_signature(text)
