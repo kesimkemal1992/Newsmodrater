@@ -1,6 +1,7 @@
 """
 ai_engine.py — Dual-layer AI analysis engine.
 Includes geopolitical exception for world leaders' statements (Trump, war, tariffs, oil disruption).
+Similarity checks now fall back to Groq if Gemini fails (e.g., rate limit 429).
 """
 
 import asyncio
@@ -409,7 +410,7 @@ class AIEngine:
             log.error(f"Both engines failed — safe reject.")
             return _reject("Both AI engines unavailable.", "engine_error", confidence=0.0)
 
-    # ─── Aggressive duplicate detection (threshold 0.55) ──────────────────────
+    # ─── Aggressive duplicate detection with Groq fallback ────────────────────
     async def is_same_story(
         self,
         text_a: str,
@@ -417,6 +418,7 @@ class AIEngine:
         image_a: Optional[bytes] = None,
         image_b: Optional[bytes] = None,
     ) -> bool:
+        """Compare two stories (text + optional images). Falls back to Groq if Gemini fails."""
         if not text_a and not text_b and not image_a and not image_b:
             return False
 
@@ -431,6 +433,7 @@ class AIEngine:
                 story_b=(text_b[:500] if text_b else ""),
             )
 
+        # Try Gemini first
         try:
             parts = []
             if image_a:
@@ -447,10 +450,36 @@ class AIEngine:
             data = _parse_json(resp.text)
             same = bool(data.get("same_story", False))
             conf = data.get("confidence", 0)
-            log.info(f"Similarity → same={same} | conf={conf}")
+            log.info(f"Gemini similarity → same={same} | conf={conf}")
             return same and conf >= 0.55
         except Exception as exc:
-            log.warning(f"Similarity check failed: {exc} — assuming not duplicate.")
+            log.warning(f"Gemini similarity failed ({exc}) — trying Groq …")
+
+        # Fallback to Groq
+        try:
+            content = []
+            if image_a:
+                content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64(image_a)}"}})
+            if image_b:
+                content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64(image_b)}"}})
+            content.append({"type": "text", "text": prompt})
+
+            resp = await asyncio.wait_for(
+                self._groq.chat.completions.create(
+                    model="meta-llama/llama-4-scout-17b-16e-instruct",
+                    messages=[{"role": "user", "content": content}],
+                    temperature=0.1,
+                    max_tokens=300,
+                ),
+                timeout=25,
+            )
+            data = _parse_json(resp.choices[0].message.content)
+            same = bool(data.get("same_story", False))
+            conf = data.get("confidence", 0)
+            log.info(f"Groq similarity → same={same} | conf={conf}")
+            return same and conf >= 0.55
+        except Exception as exc:
+            log.error(f"Both engines failed for similarity check: {exc}")
             return False
 
     # ─── ForexFactory image analysis ─────────────────────────────────────────
