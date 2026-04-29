@@ -136,7 +136,7 @@ class MemoryManager:
         )
         await self._db.commit()
 
-    async def is_image_duplicate(self, phash: str, max_distance: int = 5) -> bool:
+    async def is_image_duplicate(self, phash: str, max_distance: int = 3) -> bool:
         if not phash:
             return False
         async with self._db.execute("SELECT perceptual_hash FROM image_hashes") as cur:
