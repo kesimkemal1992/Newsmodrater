@@ -1,14 +1,14 @@
 """
 memory.py — SQLite-backed memory manager with military-grade duplicate prevention.
-Uses imagehash.phash, stores phash in recent_posts, supports Hamming distance.
 """
 
 import asyncio
 import hashlib
 import json
 import logging
+import os
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List, Tuple, Union
+from typing import Optional, List, Tuple
 
 import aiosqlite
 import imagehash
@@ -18,7 +18,12 @@ import io
 log = logging.getLogger("memory")
 
 class MemoryManager:
-    def __init__(self, db_path: str = "memory.db", ttl_days: int = 30):
+    def __init__(self, db_path: Optional[str] = None, ttl_days: int = 30):
+        if db_path is None:
+            db_path = os.environ.get("MEMORY_DB_PATH", "data/memory.db")
+        db_dir = os.path.dirname(db_path)
+        if db_dir:
+            os.makedirs(db_dir, exist_ok=True)
         self._db_path = db_path
         self._ttl_days = ttl_days
         self._db: Optional[aiosqlite.Connection] = None
@@ -43,21 +48,18 @@ class MemoryManager:
                 source      TEXT,
                 seen_at     TEXT NOT NULL
             );
-
             CREATE TABLE IF NOT EXISTS image_hashes (
                 perceptual_hash TEXT PRIMARY KEY,
                 source_channel  TEXT,
                 seen_at         TEXT NOT NULL
             );
-
             CREATE TABLE IF NOT EXISTS recent_posts (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 source_text TEXT NOT NULL,
                 post_text   TEXT NOT NULL,
-                image_phash TEXT,            -- imagehash.phash as hex string
+                image_phash TEXT,
                 created_at  TEXT NOT NULL
             );
-
             CREATE TABLE IF NOT EXISTS posted_messages (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
                 source_channel  TEXT NOT NULL,
@@ -69,62 +71,51 @@ class MemoryManager:
                 formatted_text  TEXT,
                 posted_at       TEXT NOT NULL
             );
-
             CREATE TABLE IF NOT EXISTS daily_briefings (
                 date_str    TEXT PRIMARY KEY,
                 msg_id      INTEGER NOT NULL,
                 events_json TEXT,
                 posted_at   TEXT NOT NULL
             );
-
             CREATE TABLE IF NOT EXISTS weekly_calendar (
                 week_key    TEXT PRIMARY KEY,
                 posted_at   TEXT NOT NULL
             );
-
             CREATE TABLE IF NOT EXISTS reminders (
                 event_key   TEXT PRIMARY KEY,
                 sent_at     TEXT NOT NULL
             );
-
             CREATE TABLE IF NOT EXISTS reminder_counts (
                 date_str    TEXT PRIMARY KEY,
                 count       INTEGER NOT NULL DEFAULT 0
             );
-
             CREATE TABLE IF NOT EXISTS channel_offsets (
                 channel     TEXT PRIMARY KEY,
                 last_msg_id INTEGER NOT NULL DEFAULT 0
             );
-
             CREATE TABLE IF NOT EXISTS kv_store (
                 key         TEXT PRIMARY KEY,
                 value       TEXT NOT NULL
             );
         """)
 
-    # ─── Perceptual hash (military-grade) ─────────────────────────────────────
     @staticmethod
     def compute_phash(image_data: bytes, hash_size: int = 16) -> str:
-        """Return pHash hex string. Empty string on error."""
         try:
             img = Image.open(io.BytesIO(image_data))
             phash = imagehash.phash(img, hash_size=hash_size)
-            return str(phash)   # hex representation
+            return str(phash)
         except Exception:
             return ""
 
     @staticmethod
     def hamming_distance(phash1: str, phash2: str) -> int:
-        """Return Hamming distance between two pHash hex strings."""
         if not phash1 or not phash2 or len(phash1) != len(phash2):
             return 999
-        # Convert hex to binary string
         bin1 = bin(int(phash1, 16))[2:].zfill(len(phash1)*4)
         bin2 = bin(int(phash2, 16))[2:].zfill(len(phash2)*4)
         return sum(c1 != c2 for c1, c2 in zip(bin1, bin2))
 
-    # ─── Hash deduplication (exact) ───────────────────────────────────────────
     @staticmethod
     def hash_combined(text: str, image_data: Optional[bytes]) -> str:
         h = hashlib.sha256()
@@ -135,9 +126,7 @@ class MemoryManager:
         return h.hexdigest()
 
     async def is_duplicate(self, content_hash: str) -> bool:
-        async with self._db.execute(
-            "SELECT 1 FROM content_hashes WHERE hash=?", (content_hash,)
-        ) as cur:
+        async with self._db.execute("SELECT 1 FROM content_hashes WHERE hash=?", (content_hash,)) as cur:
             return await cur.fetchone() is not None
 
     async def mark_seen(self, content_hash: str, source: str = ""):
@@ -147,9 +136,7 @@ class MemoryManager:
         )
         await self._db.commit()
 
-    # ─── Image phash tracking with Hamming distance ───────────────────────────
     async def is_image_duplicate(self, phash: str, max_distance: int = 5) -> bool:
-        """Return True if any stored image phash has Hamming distance <= max_distance."""
         if not phash:
             return False
         async with self._db.execute("SELECT perceptual_hash FROM image_hashes") as cur:
@@ -168,34 +155,28 @@ class MemoryManager:
             )
             await self._db.commit()
 
-    # ─── Recent posts (store phash, keep 200 entries) ─────────────────────────
     async def store_recent_post(self, source_text: str, post_text: str, image_phash: Optional[str] = None):
         await self._db.execute(
             "INSERT INTO recent_posts (source_text, post_text, image_phash, created_at) VALUES (?, ?, ?, ?)",
             (source_text[:1000], post_text[:1000], image_phash, _utcnow()),
         )
-        # Keep only last 200 rows (increased from 100)
         await self._db.execute("""
             DELETE FROM recent_posts
-            WHERE id NOT IN (
-                SELECT id FROM recent_posts ORDER BY id DESC LIMIT 200
-            )
+            WHERE id NOT IN (SELECT id FROM recent_posts ORDER BY id DESC LIMIT 200)
         """)
         await self._db.commit()
 
-    async def get_recent_posts(self, limit: int = 100) -> List[Tuple[str, Optional[str]]]:
-        """Return list of (source_text, image_phash) for last N posts."""
+    async def get_recent_posts(self, limit: int = 150) -> List[Tuple[str, Optional[str]]]:
         async with self._db.execute(
             "SELECT source_text, image_phash FROM recent_posts ORDER BY id DESC LIMIT ?", (limit,)
         ) as cur:
             rows = await cur.fetchall()
         return [(row["source_text"], row["image_phash"]) for row in rows]
 
-    async def get_recent_post_texts(self, limit: int = 100) -> List[str]:
+    async def get_recent_post_texts(self, limit: int = 150) -> List[str]:
         posts = await self.get_recent_posts(limit)
         return [text for text, _ in posts]
 
-    # ─── Posted messages log (unchanged) ──────────────────────────────────────
     async def log_posted(self, source_channel: str, source_msg_id: int, dest_msg_id: int,
                          content_hash: str, ai_verdict: dict, formatted_text: str):
         await self._db.execute(
@@ -209,7 +190,6 @@ class MemoryManager:
         )
         await self._db.commit()
 
-    # ─── Daily briefing (unchanged) ───────────────────────────────────────────
     async def has_daily_briefing(self, date_str: str) -> bool:
         async with self._db.execute("SELECT 1 FROM daily_briefings WHERE date_str=?", (date_str,)) as cur:
             return await cur.fetchone() is not None
@@ -226,7 +206,6 @@ class MemoryManager:
             row = await cur.fetchone()
         return row["msg_id"] if row else None
 
-    # ─── Weekly calendar (unchanged) ──────────────────────────────────────────
     async def has_weekly_posted(self, week_key: str) -> bool:
         async with self._db.execute("SELECT 1 FROM weekly_calendar WHERE week_key=?", (week_key,)) as cur:
             return await cur.fetchone() is not None
@@ -238,7 +217,6 @@ class MemoryManager:
         )
         await self._db.commit()
 
-    # ─── Reminders (unchanged) ────────────────────────────────────────────────
     async def has_reminder_been_sent(self, event_key: str) -> bool:
         async with self._db.execute("SELECT 1 FROM reminders WHERE event_key=?", (event_key,)) as cur:
             return await cur.fetchone() is not None
@@ -257,13 +235,11 @@ class MemoryManager:
 
     async def increment_reminder_count(self, date_str: str):
         await self._db.execute(
-            """INSERT INTO reminder_counts (date_str, count) VALUES (?, 1)
-               ON CONFLICT(date_str) DO UPDATE SET count = count + 1""",
+            "INSERT INTO reminder_counts (date_str, count) VALUES (?, 1) ON CONFLICT(date_str) DO UPDATE SET count = count + 1",
             (date_str,),
         )
         await self._db.commit()
 
-    # ─── Motivational index ───────────────────────────────────────────────────
     async def get_and_increment_motivational_index(self) -> int:
         async with self._db.execute("SELECT value FROM kv_store WHERE key='motivational_index'") as cur:
             row = await cur.fetchone()
@@ -276,7 +252,6 @@ class MemoryManager:
         await self._db.commit()
         return current
 
-    # ─── Channel offsets ──────────────────────────────────────────────────────
     async def get_last_msg_id(self, channel: str) -> int:
         async with self._db.execute("SELECT last_msg_id FROM channel_offsets WHERE channel=?", (channel,)) as cur:
             row = await cur.fetchone()
@@ -284,18 +259,15 @@ class MemoryManager:
 
     async def set_last_msg_id(self, channel: str, msg_id: int):
         await self._db.execute(
-            """INSERT INTO channel_offsets (channel, last_msg_id) VALUES (?, ?)
-               ON CONFLICT(channel) DO UPDATE SET last_msg_id = ?""",
+            "INSERT INTO channel_offsets (channel, last_msg_id) VALUES (?, ?) ON CONFLICT(channel) DO UPDATE SET last_msg_id = ?",
             (channel, msg_id, msg_id),
         )
         await self._db.commit()
 
-    # ─── Cleanup and stats ────────────────────────────────────────────────────
     async def _cleanup_old_hashes(self):
         cutoff = (datetime.now(timezone.utc) - timedelta(days=self._ttl_days)).isoformat()
         await self._db.execute("DELETE FROM content_hashes WHERE seen_at < ?", (cutoff,))
         await self._db.execute("DELETE FROM image_hashes WHERE seen_at < ?", (cutoff,))
-        # Also delete recent_posts older than 2 days (aggressive cleanup)
         cutoff_2d = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
         await self._db.execute("DELETE FROM recent_posts WHERE created_at < ?", (cutoff_2d,))
         await self._db.commit()
