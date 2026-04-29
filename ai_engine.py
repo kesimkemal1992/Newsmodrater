@@ -1,7 +1,8 @@
 """
 ai_engine.py — Dual-layer AI analysis engine.
-Geopolitical exception, Groq fallback, trailing year removal,
-ForexFactory prompts: USD only, GMT+3, 12-hour AM/PM, no forecast/previous.
+Geopolitical exception, Groq fallback, trailing year removal.
+ForexFactory: USD only, 12‑hour AM/PM, no forecast, original time (no conversion).
+Calendar caption: NO YEAR (only day and month, e.g., "Wednesday, April 29").
 """
 
 import asyncio
@@ -116,19 +117,20 @@ Be aggressive: if there is any reasonable chance they are the same, mark same_st
 Respond with JSON: {{"same_story": true, "confidence": 0.0-1.0, "reason": "..."}}
 """
 
-# ─── FOREXFACTORY PROMPTS (FORCE GMT+3 / EAT, 12‑HOUR AM/PM, USD ONLY, NO FORECAST) ─────
+# ─── FOREXFACTORY PROMPTS (ORIGINAL TIME – NO CONVERSION, NO YEAR IN CAPTION) ─────
 _FF_IMAGE_PROMPT = """
-You are analysing a ForexFactory economic calendar screenshot.  
-The channel’s audience is in **Ethiopia (GMT+3 / EAT)**. All times must be shown in **GMT+3** (EAT) and in **12‑hour AM/PM** format.
+You are analysing a ForexFactory economic calendar screenshot.
 
-TODAY'S DATE: {today_date}
+TODAY'S DATE: {today_date}  (the year is provided but DO NOT include it in the output)
 
 TASKS:
 1. Confirm this is a real ForexFactory calendar image (not meme/chart).
 2. Confirm it shows TODAY's date – reject otherwise.
 3. Extract **only USD high‑impact (Red 🔴) and medium‑impact (Orange 🟠) events** visible.
-4. **Convert all event times to GMT+3 (EAT)** – add the correct offset.
-5. Format a clean daily briefing – **NO forecast, NO previous data**.
+4. **Keep the original time as shown in the screenshot** – do NOT convert time zones.
+5. Convert the time to **12‑hour AM/PM** format if it is shown in 24‑hour format.
+6. Format a clean daily briefing – **NO forecast, NO previous data**.
+7. **DO NOT include the year in the date line.** Only day and month (e.g., "Wednesday, April 29").
 
 STRICT RULES:
 - Only USD events (currency = USD).
@@ -142,24 +144,27 @@ STRICT RULES:
 If not a valid FF image or not today's date:
 {{"approved": false, "reason": "not a valid ForexFactory today image"}}
 
-If valid, respond with JSON like:
-{{"approved": true, "reason": "valid FF today image", "formatted_text": "📅 TODAY'S USD HIGH IMPACT NEWS\\nDay, Month DD, YYYY\\n\\n🔴 03:30 PM | USD: Event Name\\n🟠 05:00 PM | USD: Another Event\\n\\nBe careful during these releases."}}
+If valid, respond with JSON like (note: NO year in date):
+{{"approved": true, "reason": "valid FF today image", "formatted_text": "📅 TODAY'S USD HIGH IMPACT NEWS\\nWednesday, April 29\\n\\n🔴 03:30 PM | USD: Event Name\\n🟠 05:00 PM | USD: Another Event\\n\\nBe careful during these releases."}}
+
 RESPOND WITH VALID JSON ONLY – NO MARKDOWN FENCES – NO TRAILING COMMAS.
 """.strip()
 
 _FF_WEEKLY_IMAGE_PROMPT = """
-You are analysing a ForexFactory calendar for the weekly outlook.  
-All times must be in **GMT+3 (EAT)** and **12‑hour AM/PM**.  
+You are analysing a ForexFactory calendar for the weekly outlook.
+**Keep the original time as shown in the screenshot** – do NOT convert time zones.
+Convert to 12‑hour AM/PM if needed.
 Only USD high‑impact (🔴) and medium‑impact (🟠) events.
+NO forecast, NO previous data.
+**Do NOT include the year in dates.** Use "Monday — Apr 28" not "Monday — Apr 28, 2025".
 
-CURRENT WEEK: {week_range}
+CURRENT WEEK: {week_range}  (the year is provided but do NOT include it in output)
 
-Extract events, convert times to GMT+3, group by day.  
-NO forecast, NO previous data.  
+Extract events, group by day, format as 12‑hour AM/PM.
 Plain text, no asterisks, no bold. Do not add signature.
 
 If valid:
-{{"approved": true, "reason": "valid FF weekly image", "formatted_text": "📅 WEEKLY HIGH IMPACT NEWS\\nWeek of {week_range}\\n\\nMonday — Apr 28\\n🔴 03:30 PM | USD: Event Name\\n..."}}
+{{"approved": true, "reason": "valid FF weekly image", "formatted_text": "📅 WEEKLY HIGH IMPACT NEWS\\nWeek of Apr 28 – May 2\\n\\nMonday — Apr 28\\n🔴 03:30 PM | USD: Event Name\\n..."}}
 Otherwise {{"approved": false, "reason": "..."}}
 RESPOND WITH VALID JSON ONLY.
 """.strip()
