@@ -1,8 +1,10 @@
 """
-ai_engine.py — Dual-layer AI analysis engine.
-Geopolitical exception, Groq fallback, trailing year removal.
-ForexFactory: USD only, 12‑hour AM/PM, no forecast, original time (no conversion).
-Calendar caption: NO YEAR (only day and month, e.g., "Wednesday, April 29").
+ai_engine.py — Final version.
+- Calendar posts: NO hashtags.
+- News posts: dynamic hashtags (#XAUUSD, #DXY, #OIL) based on affected assets.
+- Allows actual released numbers, bans forecast/previous/TA/signals.
+- Geopolitical exception for world leaders.
+- ForexFactory: USD only, original time, 12‑hour AM/PM, no year, no hashtags.
 """
 
 import asyncio
@@ -20,7 +22,9 @@ from groq import AsyncGroq
 log = logging.getLogger("ai_engine")
 
 CHANNEL_SIGNATURE = "\n\n[Squad 4xx](https://t.me/Squad_4xx)"
-ALLOWED_HASHTAGS = "#XAUUSD #DXY #OIL"
+
+# Allowed hashtags for news posts (AI chooses which ones)
+ALLOWED_HASHTAGS_SET = {"#XAUUSD", "#DXY", "#OIL"}
 
 def _add_us_flag_emoji(text: str) -> str:
     if not text:
@@ -58,10 +62,16 @@ CRITICAL FORMATTING RULES:
 - DO NOT use asterisks (*) or any markdown bolding
 - Use ONLY plain text and emojis
 - NO NOTE line. NO MARKET STATUS. NO commentary line.
-- NO forecast, NO previous data — never include numbers
-- Hashtags: ONLY #XAUUSD #DXY #OIL — no other hashtags
-- Do NOT add the current year at the end.
-- Do NOT add signature (added automatically)
+- **Actual released figures (e.g., "came at 2.5%", "rose to 2.5%", "was 2.5%") are ALLOWED.**
+- **Forecast (expected) and previous values are FORBIDDEN.** Never include them.
+- **Technical analysis, signals, predictions, opinions are FORBIDDEN.**
+- **Hashtags: Only use #XAUUSD, #DXY, or #OIL – only those relevant to the story.**
+  - If the story affects Gold, add #XAUUSD.
+  - If it affects USD/FX, add #DXY.
+  - If it affects Oil, add #OIL.
+  - You may add one, two, or all three, but never add any other hashtag.
+- Do NOT add the current year at the end of posts.
+- Do NOT add signature (added automatically).
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 REJECT IF ANY OF THESE APPLY (EXCEPT the Geopolitical Exception):
@@ -75,17 +85,19 @@ REJECT IF ANY OF THESE APPLY (EXCEPT the Geopolitical Exception):
 7. OFF-TOPIC     — Not about geopolitics, central banks, macro data, Gold, Oil, USD
 8. LOW VALUE     — Vague, no specific real-world event
 9. DUPLICATE     — Same story already processed
-10. PREDICTION   — "I think", "expect", "my analysis"
+10. PREDICTION   — "I think", "expect", "my analysis" (but actual results are fine)
 11. COMMENTARY   — Personal views, market opinions
+12. FORECAST/PREVIOUS — Any mention of "forecast", "expected", "previous" values
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 FORMAT (if approved):
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 [EMOJI] [SHORT ENGLISH HEADLINE — one line, factual]
 
-[Source content lightly cleaned. 2-4 sentences max. Plain facts only.]
+[Source content lightly cleaned. 2-4 sentences max.
+Actual numbers are allowed, but never show forecast or previous values.]
 
-#XAUUSD #DXY #OIL
+[Relevant hashtags from the set #XAUUSD #DXY #OIL – only those that apply]
 
 EMOJI: 🚨 🌍 📊 🏦 🛢️ 🏆 💵 ⚠️ 🗳️
 
@@ -117,7 +129,7 @@ Be aggressive: if there is any reasonable chance they are the same, mark same_st
 Respond with JSON: {{"same_story": true, "confidence": 0.0-1.0, "reason": "..."}}
 """
 
-# ─── FOREXFACTORY PROMPTS (ORIGINAL TIME – NO CONVERSION, NO YEAR IN CAPTION) ─────
+# ─── FOREXFACTORY PROMPTS (NO HASHTAGS, NO YEAR, NO FORECAST) ────────────────
 _FF_IMAGE_PROMPT = """
 You are analysing a ForexFactory economic calendar screenshot.
 
@@ -128,12 +140,13 @@ TASKS:
 2. Confirm it shows TODAY's date – reject otherwise.
 3. Extract **only USD high‑impact (Red 🔴) and medium‑impact (Orange 🟠) events** visible.
 4. **Keep the original time as shown in the screenshot** – do NOT convert time zones.
-5. Convert the time to **12‑hour AM/PM** format if it is shown in 24‑hour format.
+5. Convert the time to **12‑hour AM/PM** format if needed.
 6. Format a clean daily briefing – **NO forecast, NO previous data**.
-7. **DO NOT include the year in the date line.** Only day and month (e.g., "Wednesday, April 29").
+7. **DO NOT include the year** in the date line (only day and month, e.g., "Wednesday, April 29").
+8. **DO NOT add any hashtags** – no #XAUUSD, no #DXY, no #OIL, absolutely none.
 
 STRICT RULES:
-- Only USD events (currency = USD).
+- Only USD events.
 - Only 🔴 and 🟠 impact.
 - Times in 12‑hour AM/PM, no timezone label.
 - NO forecast values, NO previous values.
@@ -141,30 +154,30 @@ STRICT RULES:
 - Plain text only, no asterisks, no bold.
 - Do NOT add signature.
 
-If not a valid FF image or not today's date:
+If not valid:
 {{"approved": false, "reason": "not a valid ForexFactory today image"}}
 
-If valid, respond with JSON like (note: NO year in date):
-{{"approved": true, "reason": "valid FF today image", "formatted_text": "📅 TODAY'S USD HIGH IMPACT NEWS\\nWednesday, April 29\\n\\n🔴 03:30 PM | USD: Event Name\\n🟠 05:00 PM | USD: Another Event\\n\\nBe careful during these releases."}}
+If valid, respond with JSON like (note: no hashtags):
+{{"approved": true, "reason": "valid FF today image", "formatted_text": "📅 TODAY'S USD HIGH IMPACT NEWS\\nWednesday, April 29\\n\\n🔴 03:30 PM | USD: Non-Farm Payrolls\\n🟠 05:00 PM | USD: ISM PMI\\n\\nBe careful during these releases."}}
 
-RESPOND WITH VALID JSON ONLY – NO MARKDOWN FENCES – NO TRAILING COMMAS.
+RESPOND WITH VALID JSON ONLY.
 """.strip()
 
 _FF_WEEKLY_IMAGE_PROMPT = """
 You are analysing a ForexFactory calendar for the weekly outlook.
-**Keep the original time as shown in the screenshot** – do NOT convert time zones.
-Convert to 12‑hour AM/PM if needed.
+No conversion of time zones. Use 12‑hour AM/PM.
 Only USD high‑impact (🔴) and medium‑impact (🟠) events.
-NO forecast, NO previous data.
-**Do NOT include the year in dates.** Use "Monday — Apr 28" not "Monday — Apr 28, 2025".
+**NO forecast, NO previous data.**
+**Do NOT include the year** in dates (use "Monday — Apr 28").
+**DO NOT add any hashtags** – no #XAUUSD, no #DXY, no #OIL.
 
-CURRENT WEEK: {week_range}  (the year is provided but do NOT include it in output)
+CURRENT WEEK: {week_range}  (year provided but do not output it)
 
 Extract events, group by day, format as 12‑hour AM/PM.
 Plain text, no asterisks, no bold. Do not add signature.
 
-If valid:
-{{"approved": true, "reason": "valid FF weekly image", "formatted_text": "📅 WEEKLY HIGH IMPACT NEWS\\nWeek of Apr 28 – May 2\\n\\nMonday — Apr 28\\n🔴 03:30 PM | USD: Event Name\\n..."}}
+If valid example:
+{{"approved": true, "reason": "valid FF weekly image", "formatted_text": "📅 WEEKLY HIGH IMPACT NEWS\\nWeek of Apr 28 – May 2\\n\\nMonday — Apr 28\\n🔴 03:30 PM | USD: Event Name\\n\\nBe careful during these releases."}}
 Otherwise {{"approved": false, "reason": "..."}}
 RESPOND WITH VALID JSON ONLY.
 """.strip()
@@ -274,11 +287,32 @@ def _validate_and_clean(data: dict) -> dict:
     data.setdefault("confidence", 0.5)
 
     if data.get("formatted_text"):
+        # Remove asterisks
         data["formatted_text"] = data["formatted_text"].replace("*", "")
+        # Remove NOTE lines
         data["formatted_text"] = re.sub(r"📌\s*(NOTE|MARKET STATUS|STATUS)[^\n]*\n?", "", data["formatted_text"]).strip()
-        if data.get("approved"):
-            data["formatted_text"] = re.sub(r"#\w+", "", data["formatted_text"]).strip()
+        # For news posts (not calendar), we keep allowed hashtags; for calendar posts we remove all hashtags.
+        # Since calendar posts already have no hashtags (by prompt), we just ensure any stray hashtags are removed.
+        # We'll use a flag: if the text contains "TODAY'S USD HIGH IMPACT" or "WEEKLY HIGH IMPACT", it's a calendar post.
+        # Safer: remove all hashtags from calendar posts, but keep dynamic ones for news.
+        # We'll keep all hashtags that are in ALLOWED_HASHTAGS_SET, but for calendar posts we don't want any.
+        # However, since the prompts for calendar explicitly forbid hashtags, we can simply remove any hashtags that appear.
+        # To be safe, we remove all hashtags from every post that contains "TODAY'S USD HIGH IMPACT" (calendar daily) or "WEEKLY HIGH IMPACT" (calendar weekly).
+        text = data["formatted_text"]
+        if "TODAY'S USD HIGH IMPACT" in text or "WEEKLY HIGH IMPACT" in text:
+            # Calendar post: remove all hashtags
+            text = re.sub(r"#\w+", "", text).strip()
+            data["formatted_text"] = text
+        else:
+            # News post: keep only allowed hashtags
+            hashtags = re.findall(r"#\w+", text)
+            allowed_hashtags = [h for h in hashtags if h in ALLOWED_HASHTAGS_SET]
+            text = re.sub(r"#\w+", "", text).strip()
+            if allowed_hashtags:
+                text = text + "\n\n" + " ".join(allowed_hashtags)
+            data["formatted_text"] = text
 
+    # Hard reject if signal keyword appears in output
     if data.get("approved") and _signal_hit(data.get("formatted_text", "")):
         log.warning("Signal keyword in output — hard reject.")
         data["approved"] = False
@@ -473,7 +507,10 @@ class AIEngine:
             \"\"\"
             {text.strip() if text else "(image only — no text)"}
             \"\"\"
-            TASK: Analyse content. If it is relevant geopolitical/macro news (Gold, Oil, USD, central banks, geopolitics, energy, political leaders) approve and format. If signal, TA, meme, off‑topic, low‑value, stale – reject. Format according to rules. Return JSON.
+            TASK: Analyse content. If it is relevant geopolitical/macro news (Gold, Oil, USD, central banks, geopolitics, energy, political leaders) OR actual released economic data (with numbers like "2.5% came", "rose to 2.5%", "was 2.5%"), then approve and format.
+            If it contains forecast or previous values (e.g., "forecast 2.5%", "previous 2.3%"), reject.
+            If it is signal, TA, meme, off‑topic, low‑value, stale – reject.
+            Format according to rules. Return JSON.
         """).strip()
 
     async def _gemini_call(self, prompt: str, image_data: Optional[bytes], image_mime: str) -> dict:
@@ -538,17 +575,17 @@ def _reject(reason: str, issue: str, confidence: float = 1.0) -> dict:
     }
 
 def _build_post_body(text: str) -> str:
+    """Final clean: removes stray year, adds signature, does NOT add fixed hashtags (AI already handled)."""
     if not text:
         return ""
     text = text.replace("*", "")
     text = re.sub(r"📌\s*(NOTE|MARKET STATUS|STATUS)[^\n]*\n?", "", text).strip()
-    text = re.sub(r"#\w+", "", text).strip()
-    text = f"{text}\n\n{ALLOWED_HASHTAGS}"
-    text = _add_signature(text)
     # Remove any standalone 4-digit year from last 3 lines
     lines = text.split('\n')
     for i in range(max(0, len(lines)-3), len(lines)):
         lines[i] = re.sub(r'\b\d{4}\b', '', lines[i])
     text = '\n'.join(lines)
     text = re.sub(r'\n\s*\n', '\n\n', text).strip()
+    # Add signature
+    text = _add_signature(text)
     return text
