@@ -1,7 +1,6 @@
 """
 ai_engine.py — Dual-layer AI analysis engine.
-Includes geopolitical exception for world leaders' statements (Trump, war, tariffs, oil disruption).
-Similarity checks now fall back to Groq if Gemini fails (e.g., rate limit 429).
+Includes geopolitical exception, Groq fallback, and trailing year removal.
 """
 
 import asyncio
@@ -19,12 +18,9 @@ from groq import AsyncGroq
 log = logging.getLogger("ai_engine")
 
 CHANNEL_SIGNATURE = "\n\n[Squad 4xx](https://t.me/Squad_4xx)"
-
-# ─── Only three allowed hashtags ────────────────────────────────────────────
 ALLOWED_HASHTAGS = "#XAUUSD #DXY #OIL"
 
 def _add_us_flag_emoji(text: str) -> str:
-    """Add US flag emoji after first occurrence of US or USD in headline."""
     if not text:
         return text
     lines = text.split('\n')
@@ -36,7 +32,6 @@ def _add_us_flag_emoji(text: str) -> str:
     lines[0] = new_line
     return '\n'.join(lines)
 
-# ─── System prompt with geopolitical exception (Trump / war / tariffs) ────────
 _SYSTEM_PROMPT = """
 You are AXIOM INTEL — a Senior Institutional Macro & Geopolitical news editor
 for a professional Telegram trading channel. Your audience is experienced traders.
@@ -67,6 +62,7 @@ CRITICAL FORMATTING RULES:
 - NO NOTE line. NO MARKET STATUS line. NO commentary line at the end.
 - NO forecast, NO previous data — never include numbers or data tables
 - Hashtags: ONLY #XAUUSD #DXY #OIL — no other hashtags ever
+- Do NOT add the current year at the end of the post.
 - Do NOT add signature — it is added automatically after
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -112,7 +108,6 @@ RESPOND WITH VALID JSON ONLY — NO MARKDOWN FENCES — NO TRAILING COMMAS:
 {"approved": true, "reason": "brief reason", "issues": [], "formatted_text": "post text here without signature", "confidence": 0.9}
 """.strip()
 
-# ─── Similarity check prompts (aggressive) ──────────────────────────────────
 _SIMILARITY_PROMPT = """
 You are a duplicate news detector for financial/geopolitical news.
 Compare the two stories below. If they describe the same real-world event,
@@ -143,7 +138,6 @@ Be aggressive: if there is any reasonable chance they are the same, mark same_st
 Respond with JSON: {{"same_story": true, "confidence": 0.0-1.0, "reason": "..."}}
 """
 
-# ─── ForexFactory image analysis prompts ────────────────────────────────────
 _FF_IMAGE_PROMPT = """
 You are analysing a ForexFactory economic calendar screenshot posted in a Telegram channel.
 
@@ -202,7 +196,6 @@ If valid, respond with JSON containing formatted_text like:
 RESPOND WITH VALID JSON ONLY — NO MARKDOWN FENCES — NO TRAILING COMMAS.
 """.strip()
 
-# ─── 10-Minute Alert ────────────────────────────────────────────────────────
 _ALERT_PROMPT_TEMPLATE = """
 You are a Senior Institutional Trader writing a pre-event warning alert.
 
@@ -254,7 +247,6 @@ def _add_signature(text: str) -> str:
         text += CHANNEL_SIGNATURE
     return text
 
-# Motivational pool
 _MOTIVATIONAL_POOL = [
     "🛡️ Guard your account like it is your last one — because one day, it might be. Stay safe. 🔒",
     "💰 Your account is everything. One reckless trade during news can erase weeks of hard work. 🚫",
@@ -342,7 +334,6 @@ def _signal_hit(text: str) -> Optional[str]:
 def _strip_asterisks(text: str) -> str:
     return text.replace("*", "") if text else text
 
-# ─── AIEngine class ──────────────────────────────────────────────────────────
 class AIEngine:
     def __init__(self, gemini_key: str, groq_key: str, channel_category: str):
         self._category = channel_category
@@ -353,40 +344,24 @@ class AIEngine:
             model_name="gemini-2.5-flash",
             system_instruction=_SYSTEM_PROMPT,
             generation_config=genai.GenerationConfig(
-                temperature=0.15,
-                max_output_tokens=600,
-                response_mime_type="application/json",
+                temperature=0.15, max_output_tokens=600, response_mime_type="application/json"
             ),
         )
         self._gemini_text = genai.GenerativeModel(
             model_name="gemini-2.5-flash",
-            generation_config=genai.GenerationConfig(
-                temperature=0.2,
-                max_output_tokens=1200,
-            ),
+            generation_config=genai.GenerationConfig(temperature=0.2, max_output_tokens=1200),
         )
         self._gemini_vision = genai.GenerativeModel(
             model_name="gemini-2.5-flash",
             generation_config=genai.GenerationConfig(
-                temperature=0.1,
-                max_output_tokens=800,
-                response_mime_type="application/json",
+                temperature=0.1, max_output_tokens=800, response_mime_type="application/json"
             ),
         )
 
-    # ─── News moderation ──────────────────────────────────────────────────────
-    async def analyse(
-        self,
-        text: str,
-        image_data: Optional[bytes] = None,
-        image_mime: str = "image/jpeg",
-    ) -> dict:
+    async def analyse(self, text: str, image_data: Optional[bytes] = None, image_mime: str = "image/jpeg") -> dict:
         prompt = self._build_moderation_prompt(text)
-
         try:
-            verdict = await asyncio.wait_for(
-                self._gemini_call(prompt, image_data, image_mime), timeout=40
-            )
+            verdict = await asyncio.wait_for(self._gemini_call(prompt, image_data, image_mime), timeout=40)
             verdict["engine"] = "gemini-2.5-flash"
             log.info(f"Gemini → approved={verdict['approved']} | {verdict.get('reason', '')}")
             if verdict.get("approved") and verdict.get("formatted_text"):
@@ -395,11 +370,8 @@ class AIEngine:
             return verdict
         except Exception as exc:
             log.warning(f"Gemini failed ({exc}) — trying Groq …")
-
         try:
-            verdict = await asyncio.wait_for(
-                self._groq_call(prompt, image_data, image_mime), timeout=55
-            )
+            verdict = await asyncio.wait_for(self._groq_call(prompt, image_data, image_mime), timeout=55)
             verdict["engine"] = "groq-llama4-scout"
             log.info(f"Groq → approved={verdict['approved']} | {verdict.get('reason', '')}")
             if verdict.get("approved") and verdict.get("formatted_text"):
@@ -410,7 +382,6 @@ class AIEngine:
             log.error(f"Both engines failed — safe reject.")
             return _reject("Both AI engines unavailable.", "engine_error", confidence=0.0)
 
-    # ─── Aggressive duplicate detection with Groq fallback ────────────────────
     async def is_same_story(
         self,
         text_a: str,
@@ -418,10 +389,8 @@ class AIEngine:
         image_a: Optional[bytes] = None,
         image_b: Optional[bytes] = None,
     ) -> bool:
-        """Compare two stories (text + optional images). Falls back to Groq if Gemini fails."""
         if not text_a and not text_b and not image_a and not image_b:
             return False
-
         if image_a or image_b:
             prompt = _MULTIMODAL_SIMILARITY_PROMPT.format(
                 text_a=(text_a[:400] if text_a else "(no text)"),
@@ -432,7 +401,6 @@ class AIEngine:
                 story_a=(text_a[:500] if text_a else ""),
                 story_b=(text_b[:500] if text_b else ""),
             )
-
         # Try Gemini first
         try:
             parts = []
@@ -441,11 +409,9 @@ class AIEngine:
             if image_b:
                 parts.append({"inline_data": {"mime_type": "image/jpeg", "data": _b64(image_b)}})
             parts.append(prompt)
-
             loop = asyncio.get_event_loop()
             resp = await asyncio.wait_for(
-                loop.run_in_executor(None, lambda: self._gemini_vision.generate_content(parts)),
-                timeout=20,
+                loop.run_in_executor(None, lambda: self._gemini_vision.generate_content(parts)), timeout=20
             )
             data = _parse_json(resp.text)
             same = bool(data.get("same_story", False))
@@ -454,7 +420,6 @@ class AIEngine:
             return same and conf >= 0.55
         except Exception as exc:
             log.warning(f"Gemini similarity failed ({exc}) — trying Groq …")
-
         # Fallback to Groq
         try:
             content = []
@@ -463,7 +428,6 @@ class AIEngine:
             if image_b:
                 content.append({"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64(image_b)}"}})
             content.append({"type": "text", "text": prompt})
-
             resp = await asyncio.wait_for(
                 self._groq.chat.completions.create(
                     model="meta-llama/llama-4-scout-17b-16e-instruct",
@@ -482,27 +446,16 @@ class AIEngine:
             log.error(f"Both engines failed for similarity check: {exc}")
             return False
 
-    # ─── ForexFactory image analysis ─────────────────────────────────────────
-    async def analyse_ff_image(
-        self,
-        image_data: bytes,
-        image_mime: str,
-        today_date: str,
-        is_weekly: bool = False,
-        week_range: str = "",
-    ) -> dict:
+    async def analyse_ff_image(self, image_data: bytes, image_mime: str, today_date: str,
+                               is_weekly: bool = False, week_range: str = "") -> dict:
         if is_weekly:
             prompt = _FF_WEEKLY_IMAGE_PROMPT.format(week_range=week_range)
         else:
             prompt = _FF_IMAGE_PROMPT.format(today_date=today_date)
         parts = [{"inline_data": {"mime_type": image_mime, "data": _b64(image_data)}}, prompt]
-
         try:
             loop = asyncio.get_event_loop()
-            resp = await asyncio.wait_for(
-                loop.run_in_executor(None, lambda: self._gemini_vision.generate_content(parts)),
-                timeout=45,
-            )
+            resp = await asyncio.wait_for(loop.run_in_executor(None, lambda: self._gemini_vision.generate_content(parts)), timeout=45)
             data = _parse_json(resp.text)
             log.info(f"FF image → approved={data.get('approved')} | {data.get('reason', '')}")
             if data.get("approved") and data.get("formatted_text"):
@@ -510,7 +463,6 @@ class AIEngine:
             return data
         except Exception as exc:
             log.warning(f"Gemini FF failed ({exc}) — trying Groq …")
-
         try:
             content = [
                 {"type": "image_url", "image_url": {"url": f"data:{image_mime};base64,{_b64(image_data)}"}},
@@ -534,7 +486,6 @@ class AIEngine:
             log.error(f"Both engines failed for FF image: {exc}")
             return {"approved": False, "reason": "AI engines unavailable for image analysis."}
 
-    # ─── 10-minute alert generation ─────────────────────────────────────────
     async def generate_alert(self, event: dict, motivational_index: int = 0) -> str:
         impact_emoji = "🔴" if event.get("impact") == "red" else "🟠"
         motivational_line = _get_motivational_line(motivational_index)
@@ -560,7 +511,6 @@ class AIEngine:
             log.error(f"Both engines failed for alert — using fallback.")
             return self._fallback_alert(event, motivational_index)
 
-    # ─── Internal methods ────────────────────────────────────────────────────
     def _build_moderation_prompt(self, text: str) -> str:
         return textwrap.dedent(f"""
             DATE (UTC): {_today_str()}
@@ -629,8 +579,6 @@ class AIEngine:
         text = _add_us_flag_emoji(text)
         return _add_signature(text)
 
-
-# ─── Module‑level helpers ────────────────────────────────────────────────────
 def _reject(reason: str, issue: str, confidence: float = 1.0) -> dict:
     return {
         "approved": False,
@@ -646,7 +594,10 @@ def _build_post_body(text: str) -> str:
         return ""
     text = text.replace("*", "")
     text = re.sub(r"📌\s*(NOTE|MARKET STATUS|STATUS)[^\n]*\n?", "", text).strip()
+    # Remove any hashtags (AI might add extra ones)
     text = re.sub(r"#\w+", "", text).strip()
     text = f"{text}\n\n{ALLOWED_HASHTAGS}"
     text = _add_signature(text)
+    # Remove any stray 4-digit year at the very end (e.g., "2026")
+    text = re.sub(r'\s+(\d{4})$', '', text.strip())
     return text
