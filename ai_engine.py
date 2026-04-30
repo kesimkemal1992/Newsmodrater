@@ -1,5 +1,5 @@
 """
-ai_engine.py — Final version with US flag in calendar and random bulb signature.
+ai_engine.py — Final version with US flag, plain signature with link and random bulb.
 """
 
 import asyncio
@@ -17,12 +17,11 @@ from groq import AsyncGroq
 
 log = logging.getLogger("ai_engine")
 
-# Base signature without bulb (bulb added randomly later)
+# Base signature with link, bulb added randomly later
 CHANNEL_SIGNATURE = "\n\n[Squad 4xx](https://t.me/Squad_4xx)"
 ALLOWED_HASHTAGS_SET = {"#XAUUSD", "#DXY", "#OIL"}
 
 def _add_us_flag_emoji(text: str) -> str:
-    """Add US flag emoji after first occurrence of US or USD in headline."""
     if not text:
         return text
     lines = text.split('\n')
@@ -462,7 +461,7 @@ class AIEngine:
             data = _parse_json(resp.text)
             log.info(f"FF image → approved={data.get('approved')} | {data.get('reason', '')}")
             if data.get("approved") and data.get("formatted_text"):
-                # Add US flag emoji for calendar heading
+                # Add US flag emoji to calendar heading
                 data["formatted_text"] = _add_us_flag_emoji(data["formatted_text"])
             return data
         except Exception as exc:
