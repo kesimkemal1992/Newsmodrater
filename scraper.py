@@ -1,11 +1,9 @@
 """
 scraper.py — AXIOM INTEL channel scraper and forwarder.
-- Only USD high‑impact (🔴) events trigger reminders (no 🟠)
-- Geopolitical events are filtered out from daily calendar briefing.
-- Reminders reply to daily briefing post.
-- Professional motivational lines from ai_engine.
-- Strong duplicate protection for calendar images (phash + daily limit + event grouping)
-- Negative minutes check – no reminder for past events.
+- Groups same‑time events with commas.
+- Blank line after date line.
+- Negative minutes skip.
+- Geopolitical filtering from calendar.
 """
 
 import asyncio
@@ -136,6 +134,9 @@ def _normalise_urls(text: str) -> str:
     return re.sub(pattern, '', text)
 
 def _extract_events_from_ff_text(text: str) -> List[dict]:
+    """
+    Extract events from AI‑generated calendar text and group same time with commas.
+    """
     events = []
     pattern = re.compile(r"(🔴|🟠)\s+(\d{1,2}:\d{2}\s+[AP]M)\s*\|\s*([A-Z]{3}):\s*(.+)")
     for line in text.splitlines():
@@ -157,6 +158,7 @@ def _extract_events_from_ff_text(text: str) -> List[dict]:
                 "forecast": "—",
                 "previous": "—",
             })
+    # Group by (time_24h, impact, currency)
     grouped = {}
     for e in events:
         key = (e["time_24h"], e["impact"], e["currency"])
@@ -517,18 +519,23 @@ class ChannelScraper:
             self._todays_vip_events = self._select_vip_events(events)
             log.info(f"VIP reminder slots: {[e.get('name') for e in self._todays_vip_events]}")
 
-            # Rebuild calendar text with filtered events (grouped)
+            # Rebuild calendar text with grouping and blank line after date
             lines = post_text.split('\n')
             header = []
             footer = []
-            in_events_section = False
+            in_events = False
             for line in lines:
                 if line.startswith(("🔴", "🟠")):
-                    in_events_section = True
-                if not in_events_section and line.strip():
+                    in_events = True
+                if not in_events and line.strip():
                     header.append(line)
-                if line.startswith("Be careful") or line.startswith("#") or line.startswith("💡"):
+                if line.startswith("Be careful") or line.startswith("#") or line.startswith("💡") or line.startswith("[Squad"):
                     footer.append(line)
+            # Ensure a blank line after the date line (the first line of header)
+            if header:
+                # Insert blank line after first line (date)
+                new_header = [header[0], ""] + header[1:]
+                header = new_header
             event_lines = []
             for e in events:
                 emoji = "🔴" if e["impact"] == "red" else "🟠"
@@ -563,7 +570,7 @@ class ChannelScraper:
             return []
         def sort_key(e):
             return (0 if _is_priority_event(e.get("name", "")) else 1, e.get("time_24h", "99:99"))
-        vip = sorted(eligible, key=sort_key)[:1]   # only one reminder per day
+        vip = sorted(eligible, key=sort_key)[:1]
         log.info(f"Top VIP (only one): {[e.get('name') for e in vip]}")
         return vip
 
