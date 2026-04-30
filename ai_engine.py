@@ -1,5 +1,5 @@
 """
-ai_engine.py — Final version with US flag and plain signature link.
+ai_engine.py — Final version with date enforcement and per‑line event extraction.
 """
 
 import asyncio
@@ -17,7 +17,6 @@ from groq import AsyncGroq
 
 log = logging.getLogger("ai_engine")
 
-# Plain link signature (no bulb by default, but you can easily add random bulb later)
 CHANNEL_SIGNATURE = "\n\n[Squad 4xx](https://t.me/Squad_4xx)"
 ALLOWED_HASHTAGS_SET = {"#XAUUSD", "#DXY", "#OIL"}
 
@@ -140,40 +139,50 @@ Be aggressive: if there is any reasonable chance they are the same, mark same_st
 Respond with JSON: {{"same_story": true, "confidence": 0.0-1.0, "reason": "..."}}
 """
 
-# ─── FOREXFACTORY PROMPTS ────────────────────────────────────────────────
+# ========== STRENGTHENED FOREXFACTORY PROMPT ==========
 _FF_IMAGE_PROMPT = """
 You are analysing a ForexFactory economic calendar screenshot.
 
-TODAY'S DATE: {today_date}  (the year is provided but DO NOT include it in the output)
+TODAY'S DATE: {today_date}  (this is the REAL today's date – you MUST verify that the calendar shows this exact date)
 
-TASKS:
-1. Confirm this is a real ForexFactory calendar image (not meme/chart).
-2. Confirm it shows TODAY's date – reject otherwise.
-3. **Count the number of non‑USD event rows** visible (events where the currency is not USD, e.g., EUR, GBP, JPY, etc.).
-   - If there are **more than 3** non‑USD events → reject the image.
-   - If there are 0–3 non‑USD events, proceed.
-4. Extract **only USD high‑impact (Red 🔴) and medium‑impact (Orange 🟠) events** visible.
-5. **Keep the original time as shown in the screenshot** – do NOT convert time zones.
-6. Convert the time to **12‑hour AM/PM** format if needed. Do NOT show 24‑hour times.
-7. Format a clean daily briefing – **NO forecast, NO previous data**.
-8. **DO NOT include the year** in the date line (only day and month, e.g., "Wednesday, April 29").
-9. **DO NOT add any hashtags** – no #XAUUSD, no #DXY, no #OIL, absolutely none.
+CRITICAL INSTRUCTION – READ CAREFULLY:
+1. First, check the date shown in the screenshot. It MUST be exactly `{today_date}` (same month, day, and year).
+   If the screenshot shows ANY other date → REJECT the image immediately.
+
+2. If the date is correct, extract **ALL USD high‑impact (🔴) and medium‑impact (🟠) events** visible.
+   **You MUST list each event on its own line.** Do NOT combine multiple events into one line, even if they share the same time.
+
+3. **DO NOT include the year** in the date line – only day and month (e.g., "Thursday, April 30").
+
+4. **DO NOT add any hashtags** – no #XAUUSD, no #DXY, no #OIL.
+
+5. **NO forecast, NO previous data, NO NOTE line, NO commentary.**
+
+6. **Keep the original time as shown** – only convert to 12‑hour AM/PM if needed.
+
+EXAMPLE of correct output (each event on its own line):
+
+📅 TODAY'S USD HIGH IMPACT NEWS
+Thursday, April 30
+
+🔴 3:30 PM | USD: Advance GDP q/q
+🔴 3:30 PM | USD: Core PCE Price Index m/m
+🔴 3:30 PM | USD: Employment Cost Index q/q
+🟠 5:00 PM | USD: Unemployment Claims
+
+Be careful during these releases.
 
 STRICT RULES:
-- Only USD events in the final formatted text.
+- Only USD events.
 - Only 🔴 and 🟠 impact.
 - Times in 12‑hour AM/PM, no timezone label.
-- NO forecast values, NO previous values.
-- NO NOTE line, NO commentary.
-- Plain text only, no asterisks, no bold.
+- Plain text, no asterisks, no bold.
 - Do NOT add signature.
 
 If the image is not a valid ForexFactory calendar, or if it shows more than 3 non‑USD events, respond with:
-{{"approved": false, "reason": "not a valid ForexFactory today image (too many other currencies or not FF)"}}
+{{"approved": false, "reason": "not a valid ForexFactory today image"}}
 
-If valid (0–3 non‑USD events), respond with JSON like (note: no hashtags, no year):
-{{"approved": true, "reason": "valid FF today image", "formatted_text": "📅 TODAY'S USD HIGH IMPACT NEWS\\nWednesday, April 29\\n\\n🔴 03:30 PM | USD: Non-Farm Payrolls\\n🟠 05:00 PM | USD: ISM PMI\\n\\nBe careful during these releases."}}
-
+Otherwise, respond with JSON containing the formatted text exactly as in the example.
 RESPOND WITH VALID JSON ONLY.
 """.strip()
 
@@ -187,7 +196,7 @@ Only USD high‑impact (🔴) and medium‑impact (🟠) events.
 
 CURRENT WEEK: {week_range}  (year provided but do not output it)
 
-Extract events, group by day, format as 12‑hour AM/PM.
+Extract events, group by day, each event on its own line.
 Plain text, no asterisks, no bold. Do not add signature.
 
 If valid example:
