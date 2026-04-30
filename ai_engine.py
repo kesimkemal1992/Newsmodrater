@@ -1,5 +1,10 @@
 """
-ai_engine.py — Final version with US flag, plain signature with link and random bulb.
+ai_engine.py — Final version.
+- US flag emoji in calendar heading.
+- Random bulb emoji (30%) before signature.
+- Plain text signature link: [Squad 4xx](https://t.me/Squad_4xx)
+- Geopolitical/FOMC exceptions.
+- Professional motivational lines for reminders.
 """
 
 import asyncio
@@ -17,7 +22,6 @@ from groq import AsyncGroq
 
 log = logging.getLogger("ai_engine")
 
-# Base signature with link, bulb added randomly later
 CHANNEL_SIGNATURE = "\n\n[Squad 4xx](https://t.me/Squad_4xx)"
 ALLOWED_HASHTAGS_SET = {"#XAUUSD", "#DXY", "#OIL"}
 
@@ -34,7 +38,6 @@ def _add_us_flag_emoji(text: str) -> str:
     return '\n'.join(lines)
 
 def _add_signature(text: str) -> str:
-    """Append channel signature, randomly adding 💡 emoji with 30% probability."""
     text = text.strip()
     if "[Squad 4xx]" not in text:
         if random.random() < 0.3:
@@ -145,7 +148,7 @@ Be aggressive: if there is any reasonable chance they are the same, mark same_st
 Respond with JSON: {{"same_story": true, "confidence": 0.0-1.0, "reason": "..."}}
 """
 
-# ─── FOREXFACTORY PROMPTS (ONLY USD, 12‑hour AM/PM, NO YEAR, NO HASHTAGS) ────
+# ─── FOREXFACTORY PROMPTS ────────────────────────────────────────────────
 _FF_IMAGE_PROMPT = """
 You are analysing a ForexFactory economic calendar screenshot.
 
@@ -375,7 +378,7 @@ class AIEngine:
             log.info(f"Gemini → approved={verdict['approved']} | {verdict.get('reason', '')}")
             if verdict.get("approved") and verdict.get("formatted_text"):
                 verdict["formatted_text"] = _build_post_body(verdict["formatted_text"])
-                # Add US flag emoji for news posts (calendar posts start with "📅 TODAY'S USD HIGH IMPACT")
+                # Add US flag only for news posts (not calendar)
                 if not verdict["formatted_text"].startswith("📅 TODAY'S USD HIGH IMPACT"):
                     verdict["formatted_text"] = _add_us_flag_emoji(verdict["formatted_text"])
             return verdict
@@ -461,7 +464,6 @@ class AIEngine:
             data = _parse_json(resp.text)
             log.info(f"FF image → approved={data.get('approved')} | {data.get('reason', '')}")
             if data.get("approved") and data.get("formatted_text"):
-                # Add US flag emoji to calendar heading
                 data["formatted_text"] = _add_us_flag_emoji(data["formatted_text"])
             return data
         except Exception as exc:
