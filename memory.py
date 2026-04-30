@@ -1,5 +1,6 @@
 """
 memory.py — SQLite-backed memory manager with military-grade duplicate prevention.
+Includes locking methods for daily/weekly calendars with delete support.
 """
 
 import asyncio
@@ -126,7 +127,9 @@ class MemoryManager:
         return h.hexdigest()
 
     async def is_duplicate(self, content_hash: str) -> bool:
-        async with self._db.execute("SELECT 1 FROM content_hashes WHERE hash=?", (content_hash,)) as cur:
+        async with self._db.execute(
+            "SELECT 1 FROM content_hashes WHERE hash=?", (content_hash,)
+        ) as cur:
             return await cur.fetchone() is not None
 
     async def mark_seen(self, content_hash: str, source: str = ""):
@@ -191,7 +194,9 @@ class MemoryManager:
         await self._db.commit()
 
     async def has_daily_briefing(self, date_str: str) -> bool:
-        async with self._db.execute("SELECT 1 FROM daily_briefings WHERE date_str=?", (date_str,)) as cur:
+        async with self._db.execute(
+            "SELECT 1 FROM daily_briefings WHERE date_str=?", (date_str,)
+        ) as cur:
             return await cur.fetchone() is not None
 
     async def save_daily_briefing(self, date_str: str, msg_id: int, events: list):
@@ -201,13 +206,27 @@ class MemoryManager:
         )
         await self._db.commit()
 
+    async def delete_daily_briefing(self, date_str: str):
+        """
+        Remove the daily briefing lock for date_str.
+        Called when AI rejects the image or send fails, so a retry is allowed.
+        """
+        await self._db.execute(
+            "DELETE FROM daily_briefings WHERE date_str=?", (date_str,)
+        )
+        await self._db.commit()
+
     async def get_daily_briefing_msg_id(self, date_str: str) -> Optional[int]:
-        async with self._db.execute("SELECT msg_id FROM daily_briefings WHERE date_str=?", (date_str,)) as cur:
+        async with self._db.execute(
+            "SELECT msg_id FROM daily_briefings WHERE date_str=?", (date_str,)
+        ) as cur:
             row = await cur.fetchone()
         return row["msg_id"] if row else None
 
     async def has_weekly_posted(self, week_key: str) -> bool:
-        async with self._db.execute("SELECT 1 FROM weekly_calendar WHERE week_key=?", (week_key,)) as cur:
+        async with self._db.execute(
+            "SELECT 1 FROM weekly_calendar WHERE week_key=?", (week_key,)
+        ) as cur:
             return await cur.fetchone() is not None
 
     async def save_weekly_posted(self, week_key: str):
@@ -217,8 +236,20 @@ class MemoryManager:
         )
         await self._db.commit()
 
+    async def delete_weekly_posted(self, week_key: str):
+        """
+        Remove the weekly calendar lock for week_key.
+        Called when AI rejects the image or send fails, so a retry is allowed.
+        """
+        await self._db.execute(
+            "DELETE FROM weekly_calendar WHERE week_key=?", (week_key,)
+        )
+        await self._db.commit()
+
     async def has_reminder_been_sent(self, event_key: str) -> bool:
-        async with self._db.execute("SELECT 1 FROM reminders WHERE event_key=?", (event_key,)) as cur:
+        async with self._db.execute(
+            "SELECT 1 FROM reminders WHERE event_key=?", (event_key,)
+        ) as cur:
             return await cur.fetchone() is not None
 
     async def mark_reminder_sent(self, event_key: str):
@@ -229,19 +260,24 @@ class MemoryManager:
         await self._db.commit()
 
     async def get_reminder_count_today(self, date_str: str) -> int:
-        async with self._db.execute("SELECT count FROM reminder_counts WHERE date_str=?", (date_str,)) as cur:
+        async with self._db.execute(
+            "SELECT count FROM reminder_counts WHERE date_str=?", (date_str,)
+        ) as cur:
             row = await cur.fetchone()
         return row["count"] if row else 0
 
     async def increment_reminder_count(self, date_str: str):
         await self._db.execute(
-            "INSERT INTO reminder_counts (date_str, count) VALUES (?, 1) ON CONFLICT(date_str) DO UPDATE SET count = count + 1",
+            """INSERT INTO reminder_counts (date_str, count) VALUES (?, 1)
+               ON CONFLICT(date_str) DO UPDATE SET count = count + 1""",
             (date_str,),
         )
         await self._db.commit()
 
     async def get_and_increment_motivational_index(self) -> int:
-        async with self._db.execute("SELECT value FROM kv_store WHERE key='motivational_index'") as cur:
+        async with self._db.execute(
+            "SELECT value FROM kv_store WHERE key='motivational_index'"
+        ) as cur:
             row = await cur.fetchone()
         current = int(row["value"]) if row else 0
         next_val = current + 1
@@ -253,21 +289,29 @@ class MemoryManager:
         return current
 
     async def get_last_msg_id(self, channel: str) -> int:
-        async with self._db.execute("SELECT last_msg_id FROM channel_offsets WHERE channel=?", (channel,)) as cur:
+        async with self._db.execute(
+            "SELECT last_msg_id FROM channel_offsets WHERE channel=?", (channel,)
+        ) as cur:
             row = await cur.fetchone()
         return row["last_msg_id"] if row else 0
 
     async def set_last_msg_id(self, channel: str, msg_id: int):
         await self._db.execute(
-            "INSERT INTO channel_offsets (channel, last_msg_id) VALUES (?, ?) ON CONFLICT(channel) DO UPDATE SET last_msg_id = ?",
+            """INSERT INTO channel_offsets (channel, last_msg_id) VALUES (?, ?)
+               ON CONFLICT(channel) DO UPDATE SET last_msg_id = ?""",
             (channel, msg_id, msg_id),
         )
         await self._db.commit()
 
     async def _cleanup_old_hashes(self):
         cutoff = (datetime.now(timezone.utc) - timedelta(days=self._ttl_days)).isoformat()
-        await self._db.execute("DELETE FROM content_hashes WHERE seen_at < ?", (cutoff,))
-        await self._db.execute("DELETE FROM image_hashes WHERE seen_at < ?", (cutoff,))
+        await self._db.execute(
+            "DELETE FROM content_hashes WHERE seen_at < ?", (cutoff,)
+        )
+        await self._db.execute(
+            "DELETE FROM image_hashes WHERE seen_at < ?", (cutoff,)
+        )
+        # Delete recent posts older than 2 days
         cutoff_2d = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
         await self._db.execute("DELETE FROM recent_posts WHERE created_at < ?", (cutoff_2d,))
         await self._db.commit()
@@ -280,7 +324,10 @@ class MemoryManager:
             "SELECT COUNT(*) as n FROM posted_messages WHERE posted_at > ?", (cutoff_24h,)
         ) as cur:
             posted_24h = (await cur.fetchone())["n"]
-        return {"tracked_hashes": hashes, "posted_last_24h": posted_24h}
+        return {
+            "tracked_hashes": hashes,
+            "posted_last_24h": posted_24h,
+        }
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
