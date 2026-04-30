@@ -1,9 +1,9 @@
 """
 scraper.py — AXIOM INTEL channel scraper and forwarder.
-- Accepts ForexFactory calendar images as posted (no cropping by bot).
-- Caption only lists USD high‑impact (🔴) and medium‑impact (🟠) events.
-- Times always 12‑hour AM/PM, no timezone labels.
-- Once per day. Duplicate prevention via phash and daily flag.
+- Only USD high‑impact (🔴) events trigger reminders (no 🟠)
+- Same‑time events grouped in calendar caption
+- Reminders reply to daily briefing post
+- Professional motivational lines from ai_engine
 """
 
 import asyncio
@@ -14,7 +14,7 @@ import mimetypes
 import random
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List
+from typing import Optional, List, Dict, Tuple
 
 import pytz
 from telethon import TelegramClient
@@ -60,13 +60,13 @@ _UNIQUE_EVENT_NAMES = [
     "pce", "gdp", "fed chair", "powell speaks"
 ]
 
+# Only truly market-moving red events (high liquidity, high volatility)
 _HIGH_IMPACT_KEYWORDS = [
     "fomc", "federal funds rate", "interest rate decision",
     "non-farm payroll", "nfp", "consumer price index", "cpi",
     "pce", "core pce", "gdp", "advance gdp", "preliminary gdp",
     "fed chair", "powell speaks", "unemployment rate", "retail sales",
-    "ism manufacturing", "ism non-manufacturing", "philly fed",
-    "empire state", "durable goods", "housing starts"
+    "ism manufacturing", "ism non-manufacturing"
 ]
 
 def _is_fomc_event(name: str) -> bool:
@@ -74,20 +74,14 @@ def _is_fomc_event(name: str) -> bool:
     return any(kw in n for kw in _FOMC_KEYWORDS)
 
 def _is_reminder_eligible(event: dict) -> bool:
+    # Only red impact (no orange)
     if event.get("impact") != "red":
         return False
     name_lower = event.get("name", "").lower()
     for kw in _HIGH_IMPACT_KEYWORDS:
         if kw in name_lower:
             return True
-    currency = event.get("currency", "").upper().strip()
-    is_usd = currency == "USD"
-    is_gold = any(kw in name_lower for kw in _GOLD_KEYWORDS)
-    if not (is_usd or is_gold):
-        return False
-    forecast = event.get("forecast", "").strip()
-    previous = event.get("previous", "").strip()
-    return bool(forecast and forecast != "—" and previous and previous != "—")
+    return False
 
 def _is_priority_event(name: str) -> bool:
     n = name.lower()
@@ -135,6 +129,9 @@ def _normalise_urls(text: str) -> str:
     return re.sub(pattern, '', text)
 
 def _extract_events_from_ff_text(text: str) -> List[dict]:
+    """
+    Extract events from AI‑generated calendar text, group same time, convert to 24h.
+    """
     events = []
     pattern = re.compile(r"(🔴|🟠)\s+(\d{1,2}:\d{2}\s+[AP]M)\s*\|\s*([A-Z]{3}):\s*(.+)")
     for line in text.splitlines():
@@ -142,6 +139,7 @@ def _extract_events_from_ff_text(text: str) -> List[dict]:
         if m:
             emoji, time_12h, currency, name = m.groups()
             impact = "red" if emoji == "🔴" else "orange"
+            # convert 12h to 24h for internal sorting/reminder
             try:
                 dt = datetime.strptime(time_12h.strip(), "%I:%M %p")
                 time_24h = dt.strftime("%H:%M")
@@ -156,7 +154,21 @@ def _extract_events_from_ff_text(text: str) -> List[dict]:
                 "forecast": "—",
                 "previous": "—",
             })
-    return events
+    # Group same time (by time_24h) – combine names with commas
+    grouped = {}
+    for e in events:
+        key = (e["time_24h"], e["impact"], e["currency"])
+        if key not in grouped:
+            grouped[key] = e.copy()
+            grouped[key]["name"] = [e["name"]]
+        else:
+            grouped[key]["name"].append(e["name"])
+    # Convert back to list with combined names
+    result = []
+    for key, e in grouped.items():
+        e["name"] = ", ".join(e["name"]) if isinstance(e["name"], list) else e["name"]
+        result.append(e)
+    return result
 
 class ChannelScraper:
     def __init__(self, config: dict, ai_engine: AIEngine, memory: MemoryManager):
@@ -236,7 +248,7 @@ class ChannelScraper:
             await asyncio.sleep(1)
         return sent
 
-    async def _broadcast_file_with_caption(self, file_bytes: bytes, mime: str, caption: str):
+    async def _broadcast_file_with_caption(self, file_bytes: bytes, mime: str, caption: str, reply_to: int = None):
         sent = None
         for dest in self._dest_channels:
             try:
@@ -244,18 +256,18 @@ class ChannelScraper:
                 buf = io.BytesIO(file_bytes)
                 buf.name = f"calendar{ext}"
                 buf.seek(0)
-                sent = await self._client.send_file(dest, buf, caption=caption, parse_mode="md", force_document=False)
+                sent = await self._client.send_file(dest, buf, caption=caption, parse_mode="md", force_document=False, reply_to=reply_to)
                 log.info(f"  → File sent to {dest} | msg_id={sent.id}")
             except Exception as exc:
                 log.error(f"Send file error on {dest}: {exc}")
                 try:
-                    sent = await self._client.send_message(dest, caption, parse_mode="md")
+                    sent = await self._client.send_message(dest, caption, parse_mode="md", reply_to=reply_to)
                 except Exception as exc2:
                     log.error(f"Text fallback failed for {dest}: {exc2}")
             await asyncio.sleep(1)
         return sent
 
-    async def _broadcast_media(self, text: str, image_data: Optional[bytes], image_mime: str):
+    async def _broadcast_media(self, text: str, image_data: Optional[bytes], image_mime: str, reply_to: int = None):
         sent = None
         for dest in self._dest_channels:
             try:
@@ -264,9 +276,9 @@ class ChannelScraper:
                     ext = mimetypes.guess_extension(image_mime) or ".jpg"
                     buf.name = f"media{ext}"
                     buf.seek(0)
-                    sent = await self._client.send_file(dest, buf, caption=text, parse_mode="md")
+                    sent = await self._client.send_file(dest, buf, caption=text, parse_mode="md", reply_to=reply_to)
                 else:
-                    sent = await self._client.send_message(dest, text, parse_mode="md")
+                    sent = await self._client.send_message(dest, text, parse_mode="md", reply_to=reply_to)
                 log.info(f"  → Post sent to {dest} | msg_id={sent.id}")
             except ChatWriteForbiddenError:
                 log.error(f"❌ No permission to post to {dest}.")
@@ -279,9 +291,9 @@ class ChannelScraper:
                         ext = mimetypes.guess_extension(image_mime) or ".jpg"
                         buf.name = f"media{ext}"
                         buf.seek(0)
-                        sent = await self._client.send_file(dest, buf, caption=text, parse_mode="md")
+                        sent = await self._client.send_file(dest, buf, caption=text, parse_mode="md", reply_to=reply_to)
                     else:
-                        sent = await self._client.send_message(dest, text, parse_mode="md")
+                        sent = await self._client.send_message(dest, text, parse_mode="md", reply_to=reply_to)
                 except Exception:
                     pass
             except Exception as exc:
@@ -472,7 +484,6 @@ class ChannelScraper:
             if not post_text:
                 return
             post_text = _add_signature(post_text)
-            # No cropping – use original image
             sent = await self._broadcast_file_with_caption(image_data, image_mime, post_text)
             if sent:
                 await self._mem.save_weekly_posted(week_key)
@@ -494,11 +505,37 @@ class ChannelScraper:
                 return
             post_text = _add_signature(post_text)
 
+            # Extract events with grouping (same time)
             events = _extract_events_from_ff_text(post_text)
             self._todays_vip_events = self._select_vip_events(events)
             log.info(f"VIP reminder slots: {[e.get('name') for e in self._todays_vip_events]}")
 
-            # Use original image as provided (already cropped by source channel)
+            # Reconstruct the calendar text with grouped events
+            lines = post_text.split('\n')
+            new_lines = []
+            for line in lines:
+                if line.startswith(("🔴", "🟠")):
+                    # Replace line with grouped version? Already grouped in events, we need to reformat.
+                    # Simpler: we already have grouped events, rebuild the calendar block.
+                    pass
+            # Actually, post_text already contains the raw AI output. We'll replace it with our grouped version.
+            grouped_lines = []
+            for e in events:
+                grouped_lines.append(f"{e['impact_emoji']} {e['time_12h']} | {e['currency']}: {e['name']}")
+            # Keep header and footer
+            header = []
+            footer = []
+            in_events = False
+            for line in lines:
+                if line.startswith(("🔴", "🟠")):
+                    in_events = True
+                if not in_events and line.strip():
+                    header.append(line)
+                if line.startswith("Be careful") or line.startswith("#") or line.startswith("💡"):
+                    footer.append(line)
+            new_calendar_text = "\n".join(header + grouped_lines + footer)
+            post_text = new_calendar_text
+
             sent = await self._broadcast_file_with_caption(image_data, image_mime, post_text)
             if sent:
                 await self._mem.save_daily_briefing(today_str, sent.id, events)
@@ -526,8 +563,8 @@ class ChannelScraper:
             return []
         def sort_key(e):
             return (0 if _is_priority_event(e.get("name", "")) else 1, e.get("time_24h", "99:99"))
-        vip = sorted(eligible, key=sort_key)[:2]
-        log.info(f"Top 2 VIP: {[e.get('name') for e in vip]}")
+        vip = sorted(eligible, key=sort_key)[:1]   # only one reminder per day
+        log.info(f"Top VIP (only one): {[e.get('name') for e in vip]}")
         return vip
 
     async def _check_reminders(self):
@@ -578,11 +615,21 @@ class ChannelScraper:
 
     async def _send_reminder(self, event: dict, event_key: str, reply_to_msg_id: int, today_str: str, minutes_left: int):
         log.info(f"⏰ Sending {minutes_left}-min reminder for {event.get('name')} at {event.get('time_12h')}")
+        event_name = event.get("name", "Unknown Event")
+        impact_emoji = "🔴" if event.get("impact") == "red" else "🟠"
         mot_index = await self._mem.get_and_increment_motivational_index()
-        alert_text = await self._ai.generate_alert(event, minutes_left, mot_index)
-        if not alert_text:
-            log.error(f"Failed to generate alert for {event.get('name')}")
-            return
+        motivational_line = await self._ai.get_motivational_line(event_name, mot_index)
+        alert_text = (
+            f"🚨 ALERT: {minutes_left} MINUTES REMAINING\n\n"
+            f"{impact_emoji} {event_name}\n"
+            f"🕒 {event.get('time_12h')}\n\n"
+            f"REQUIRED ACTION:\n"
+            f"✅ Secure open profits now\n"
+            f"✅ Move Stop-Loss to Break-even\n"
+            f"✅ No new entries during the release\n\n"
+            f"{motivational_line}"
+        )
+        alert_text = _add_signature(alert_text)
         for dest in self._dest_channels:
             try:
                 sent = await self._client.send_message(dest, alert_text, parse_mode="md", reply_to=reply_to_msg_id)
