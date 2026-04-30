@@ -6,6 +6,7 @@ scraper.py — AXIOM INTEL channel scraper and forwarder.
 - Geopolitical events filtered out.
 - Date without trailing comma and without year.
 - Robust event extraction with debug logging.
+- DUPLICATE GLITCH FIXED: all locks acquired BEFORE AI call / broadcast.
 """
 
 import asyncio
@@ -137,12 +138,14 @@ def _normalise_urls(text: str) -> str:
 
 def _extract_events_from_ff_text(text: str) -> List[dict]:
     """
-    Extract and group same‑time USD events from AI‑generated calendar text.
+    Extract and group same-time USD events from AI-generated calendar text.
     """
     events = []
-    # Very flexible pattern: allow missing '|', extra spaces, etc.
-    pattern = re.compile(r"(🔴|🟠)\s+(\d{1,2}:\d{2}\s+[AP]M)\s*\|?\s*([A-Z]{3}):\s*(.+?)(?=\n|$)", re.IGNORECASE)
-    
+    pattern = re.compile(
+        r"(🔴|🟠)\s+(\d{1,2}:\d{2}\s+[AP]M)\s*\|?\s*([A-Z]{3}):\s*(.+?)(?=\n|$)",
+        re.IGNORECASE
+    )
+
     for line in text.splitlines():
         line = line.strip()
         if not line:
@@ -151,54 +154,63 @@ def _extract_events_from_ff_text(text: str) -> List[dict]:
         if m:
             emoji, time_12h, currency, name = m.groups()
             impact = "red" if emoji == "🔴" else "orange"
+            time_12h = time_12h.strip()
             try:
-                dt = datetime.strptime(time_12h.strip(), "%I:%M %p")
+                dt = datetime.strptime(time_12h, "%I:%M %p")
                 time_24h = dt.strftime("%H:%M")
+                time_12h = dt.strftime("%-I:%M %p")   # no leading zero e.g. "3:30 PM"
             except ValueError:
-                time_24h = ""
+                try:
+                    dt = datetime.strptime(time_12h, "%I:%M%p")
+                    time_24h = dt.strftime("%H:%M")
+                    time_12h = dt.strftime("%-I:%M %p")
+                except ValueError:
+                    time_24h = ""
             events.append({
-                "name": name.strip(),
+                "name":     name.strip(),
                 "currency": currency.strip(),
-                "impact": impact,
-                "time_12h": time_12h.strip(),
+                "impact":   impact,
+                "time_12h": time_12h,
                 "time_24h": time_24h,
             })
-    
-    # If we still get no events, log the AI output to debug
+
     if not events:
         log.error("❌ No events extracted! Raw AI output:\n%s", text[:1000])
         return []
-    
-    # Group by time_24h
-    grouped = {}
+
+    # Group by time_24h — same slot → one line, comma-separated names
+    grouped: dict = {}
     for e in events:
         key = e["time_24h"]
         if key not in grouped:
             grouped[key] = {
                 "time_12h": e["time_12h"],
-                "impact": e["impact"],
-                "currency": e["currency"],
-                "names": [e["name"]],
-                "has_red": e["impact"] == "red"
+                "time_24h": key,
+                "currency": "USD",
+                "impact":   e["impact"],
+                "has_red":  e["impact"] == "red",
+                "names":    [e["name"]],
             }
         else:
             grouped[key]["names"].append(e["name"])
             if e["impact"] == "red":
                 grouped[key]["has_red"] = True
                 grouped[key]["impact"] = "red"
-    
+
     result = []
-    for key, g in grouped.items():
+    for key in sorted(grouped.keys()):
+        g = grouped[key]
         result.append({
-            "name": ", ".join(g["names"]),
-            "currency": "USD",
-            "impact": "red" if g["has_red"] else "orange",
+            "name":     ", ".join(g["names"]),
+            "currency": g["currency"],
+            "impact":   "red" if g["has_red"] else "orange",
             "time_12h": g["time_12h"],
-            "time_24h": key,
+            "time_24h": g["time_24h"],
         })
-    
+
     log.info(f"✅ Extracted {len(result)} grouped event(s): {[e['name'] for e in result]}")
     return result
+
 
 class ChannelScraper:
     def __init__(self, config: dict, ai_engine: AIEngine, memory: MemoryManager):
@@ -404,6 +416,8 @@ class ChannelScraper:
             return
 
         content_hash = self._mem.hash_combined(text, image_data)
+
+        # ── DUPLICATE CHECK ────────────────────────────────────────────────
         if await self._mem.is_duplicate(content_hash):
             log.info(f"[SKIP] Exact hash duplicate — {content_hash[:12]}…")
             return
@@ -411,18 +425,22 @@ class ChannelScraper:
             log.info(f"[SKIP] Image phash duplicate (Hamming ≤3) — {phash}")
             await self._mem.mark_image_seen(phash, source_channel)
             return
+
+        # ── LOCK IMMEDIATELY — before any slow AI call ─────────────────────
+        # Any second message with the same hash arriving while AI is running
+        # (5-40s) will now hit is_duplicate() above and be blocked.
+        await self._mem.mark_seen(content_hash, source=source_channel)
+        if phash:
+            # Mark image seen always here — not only on send success.
+            # Prevents: send fails → phash unsaved → next poll re-posts.
+            await self._mem.mark_image_seen(phash, source_channel)
+
         if await self._is_similar_to_recent(text, image_data, phash):
             log.info(f"[SKIP] Duplicate detected (event name match or AI similarity).")
-            await self._mem.mark_seen(content_hash, source=source_channel)
-            if phash:
-                await self._mem.mark_image_seen(phash, source_channel)
             return
 
         log.info(f"🔍 Analysing msg {msg.id} from {source_channel} | text={len(text)}c | image={'✅' if image_data else '❌'}")
         verdict = await self._ai.analyse(text, image_data, image_mime)
-        await self._mem.mark_seen(content_hash, source=source_channel)
-        if phash:
-            await self._mem.mark_image_seen(phash, source_channel)
 
         if not verdict.get("approved"):
             log.info(f"[REJECTED] reason='{verdict.get('reason')}' | issues={verdict.get('issues')}")
@@ -605,9 +623,15 @@ class ChannelScraper:
         today_display = _eat_today_display()
 
         phash = self._mem.compute_phash(image_data)
-        if phash and await self._mem.is_image_duplicate(phash, max_distance=3):
-            log.info(f"[SKIP] FF image duplicate (phash distance ≤3) — {phash}")
-            return
+
+        # ── LOCK phash BEFORE duplicate check & AI call ────────────────────
+        # Prevents: same FF image from 2 sources arriving at the same time,
+        # both passing the phash check (not yet saved), both calling AI, both posting.
+        if phash:
+            if await self._mem.is_image_duplicate(phash, max_distance=3):
+                log.info(f"[SKIP] FF image duplicate (phash distance ≤3) — {phash}")
+                return
+            await self._mem.mark_image_seen(phash, source_channel)  # lock now
 
         if is_weekly:
             now = _eat_now()
@@ -615,80 +639,99 @@ class ChannelScraper:
             week_end = week_start + timedelta(days=4)
             week_range = f"{week_start.strftime('%b %d')} – {week_end.strftime('%b %d, %Y')}"
             week_key = now.strftime("%Y-%W")
+
             if await self._mem.has_weekly_posted(week_key):
                 log.info(f"[SKIP] Weekly calendar already posted this week ({week_key}).")
                 return
+            # ── LOCK weekly flag BEFORE AI call ────────────────────────────
+            # Prevents: 2 sources bring same weekly image simultaneously,
+            # both pass has_weekly_posted(), both call AI (45s), both post.
+            await self._mem.save_weekly_posted(week_key)
             log.info("📆 Weekly FF image detected — analysing …")
+
             result = await self._ai.analyse_ff_image(image_data, image_mime, today_date=today_display,
                                                      is_weekly=True, week_range=week_range)
             if not result.get("approved"):
+                # AI rejected — unlock so a better image can be retried
+                await self._mem.delete_weekly_posted(week_key)
                 log.info(f"[SKIP] Weekly FF image rejected: {result.get('reason')}")
                 return
             post_text = result.get("formatted_text", "").strip()
             if not post_text:
+                await self._mem.delete_weekly_posted(week_key)
                 return
             post_text = _add_signature(post_text)
             sent = await self._broadcast_file_with_caption(image_data, image_mime, post_text)
             if sent:
-                await self._mem.save_weekly_posted(week_key)
-                if phash:
-                    await self._mem.mark_image_seen(phash, source_channel)
                 log.info(f"📆 Weekly calendar posted → msg_id={sent.id}")
+            else:
+                # Send failed — unlock so next poll can retry
+                await self._mem.delete_weekly_posted(week_key)
+
         else:
             if await self._mem.has_daily_briefing(today_str):
                 log.info(f"[SKIP] Daily briefing already posted today ({today_str}).")
                 return
-
+            # ── LOCK daily flag BEFORE AI call ─────────────────────────────
+            # Prevents: 2 sources bring same daily FF image simultaneously,
+            # both pass has_daily_briefing(), both call AI (45s), both post.
+            # Use placeholder msg_id=-1 until real send succeeds.
+            await self._mem.save_daily_briefing(today_str, -1, [])
             log.info("📅 Daily FF image detected — analysing …")
+
             result = await self._ai.analyse_ff_image(image_data, image_mime, today_date=today_display, is_weekly=False)
             if not result.get("approved"):
+                # AI rejected — unlock so a better image can be retried
+                await self._mem.delete_daily_briefing(today_str)
                 log.info(f"[SKIP] Daily FF image rejected: {result.get('reason')}")
                 return
-            post_text = result.get("formatted_text", "").strip()
-            if not post_text:
+
+            raw_text = result.get("formatted_text", "").strip()
+            if not raw_text:
+                await self._mem.delete_daily_briefing(today_str)
                 return
-            post_text = _add_signature(post_text)
 
-            # DEBUG: log the raw AI output
-            log.info(f"📄 Raw AI output:\n{post_text}")
+            log.info(f"📄 Raw AI output:\n{raw_text}")
 
-            events = _extract_events_from_ff_text(post_text)
+            events = _extract_events_from_ff_text(raw_text)
 
-            # Filter out geopolitical events
+            # Filter geopolitical events
             filtered_events = []
             for e in events:
                 name_lower = e.get("name", "").lower()
                 if any(kw in name_lower for kw in GEOPOLITICAL_KEYWORDS):
-                    log.info(f"Removing geopolitical event from calendar: {e.get('name')}")
+                    log.info(f"Removing geopolitical event: {e.get('name')}")
                     continue
                 filtered_events.append(e)
             events = filtered_events
+
             if not events:
+                await self._mem.delete_daily_briefing(today_str)
                 log.info("All events were geopolitical – skipping daily briefing.")
                 return
 
             self._todays_vip_events = self._select_vip_events(events)
             log.info(f"VIP reminder slots: {[e.get('name') for e in self._todays_vip_events]}")
 
-            # Build final calendar text with proper spacing and date without trailing comma
-            title = "📅 TODAY'S USD 🇺🇸 HIGH IMPACT NEWS"
-            date_line = _eat_now().strftime("%A, %B %d")   # e.g., "Thursday, April 30"
-            output_lines = [
-                title,
-                "",          # blank line after title
-                date_line,
-                "",          # blank line after date
-            ]
+            # Build final post
+            title     = "📅 TODAY'S USD 🇺🇸 HIGH IMPACT NEWS"
+            date_line = _eat_now().strftime("%A, %B %d")
+
+            output_lines = [title, "", date_line, ""]
             for e in events:
                 emoji = "🔴" if e["impact"] == "red" else "🟠"
                 output_lines.append(f"{emoji} {e['time_12h']} | {e['currency']}: {e['name']}")
-            # No "Be careful" line
+
             post_text = "\n".join(output_lines)
             post_text = _add_signature(post_text)
 
+            log.info(f"📅 Final post preview:\n{post_text}")
+
             sent = await self._broadcast_file_with_caption(image_data, image_mime, post_text)
             if sent:
+                # Update placeholder with real msg_id and events
                 await self._mem.save_daily_briefing(today_str, sent.id, events)
-                if phash:
-                    await self._mem.mark_image_seen(phash, source_channel)
                 log.info(f"📅 Daily briefing posted → msg_id={sent.id}")
+            else:
+                # Send failed — unlock so next poll can retry
+                await self._mem.delete_daily_briefing(today_str)
