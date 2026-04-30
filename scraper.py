@@ -1,10 +1,11 @@
 """
 scraper.py — AXIOM INTEL channel scraper and forwarder.
-- Groups same‑time events (red+orange) into a single line, comma‑separated.
+- Groups same‑time events (red+orange) into a single line.
 - Blank lines after title and after date.
 - No "Be careful" line.
 - Geopolitical events filtered out.
 - Date without trailing comma and without year.
+- Robust event extraction with debug logging.
 """
 
 import asyncio
@@ -136,91 +137,68 @@ def _normalise_urls(text: str) -> str:
 
 def _extract_events_from_ff_text(text: str) -> List[dict]:
     """
-    Extract events from AI‑generated calendar text.
-    Groups same‑time events into one entry — comma‑separated names.
-    If ANY event at a given time is red, the whole group becomes red.
-    Returns a list ordered by time_24h ascending.
+    Extract and group same‑time USD events from AI‑generated calendar text.
     """
-    raw_events = []
-    pattern = re.compile(r"(🔴|🟠)\s+(\d{1,2}:\d{2}\s*[AP]M)\s*\|\s*([A-Z]{3}):\s*(.+)")
-
+    events = []
+    # Very flexible pattern: allow missing '|', extra spaces, etc.
+    pattern = re.compile(r"(🔴|🟠)\s+(\d{1,2}:\d{2}\s+[AP]M)\s*\|?\s*([A-Z]{3}):\s*(.+?)(?=\n|$)", re.IGNORECASE)
+    
     for line in text.splitlines():
-        m = pattern.search(line)
-        if not m:
+        line = line.strip()
+        if not line:
             continue
-        emoji, time_12h, currency, name = m.groups()
-        impact = "red" if emoji == "🔴" else "orange"
-        time_12h = time_12h.strip()
-        # Normalise to sortable 24h key
-        try:
-            dt = datetime.strptime(time_12h, "%I:%M %p")
-            time_24h = dt.strftime("%H:%M")
-        except ValueError:
+        m = pattern.search(line)
+        if m:
+            emoji, time_12h, currency, name = m.groups()
+            impact = "red" if emoji == "🔴" else "orange"
             try:
-                dt = datetime.strptime(time_12h, "%I:%M%p")
+                dt = datetime.strptime(time_12h.strip(), "%I:%M %p")
                 time_24h = dt.strftime("%H:%M")
             except ValueError:
                 time_24h = ""
-
-        raw_events.append({
-            "name":     name.strip(),
-            "currency": currency.strip(),
-            "impact":   impact,
-            "time_12h": time_12h,
-            "time_24h": time_24h,
-        })
-
-    # ── Group by time_24h, preserving insertion order ─────────────────────
-    # Use an ordered dict keyed by time_24h
-    grouped: dict[str, dict] = {}
-    for e in raw_events:
+            events.append({
+                "name": name.strip(),
+                "currency": currency.strip(),
+                "impact": impact,
+                "time_12h": time_12h.strip(),
+                "time_24h": time_24h,
+            })
+    
+    # If we still get no events, log the AI output to debug
+    if not events:
+        log.error("❌ No events extracted! Raw AI output:\n%s", text[:1000])
+        return []
+    
+    # Group by time_24h
+    grouped = {}
+    for e in events:
         key = e["time_24h"]
         if key not in grouped:
             grouped[key] = {
                 "time_12h": e["time_12h"],
-                "time_24h": key,
-                "currency": "USD",
-                "impact":   e["impact"],
-                "has_red":  e["impact"] == "red",
-                "names":    [e["name"]],
+                "impact": e["impact"],
+                "currency": e["currency"],
+                "names": [e["name"]],
+                "has_red": e["impact"] == "red"
             }
         else:
             grouped[key]["names"].append(e["name"])
             if e["impact"] == "red":
                 grouped[key]["has_red"] = True
                 grouped[key]["impact"] = "red"
-
-    # Sort by 24h time ascending
+    
     result = []
-    for key in sorted(grouped.keys()):
-        g = grouped[key]
+    for key, g in grouped.items():
         result.append({
-            "name":     ", ".join(g["names"]),   # comma-separated names
-            "currency": g["currency"],
-            "impact":   "red" if g["has_red"] else "orange",
+            "name": ", ".join(g["names"]),
+            "currency": "USD",
+            "impact": "red" if g["has_red"] else "orange",
             "time_12h": g["time_12h"],
-            "time_24h": g["time_24h"],
+            "time_24h": key,
         })
-
+    
+    log.info(f"✅ Extracted {len(result)} grouped event(s): {[e['name'] for e in result]}")
     return result
-
-
-def _format_calendar_lines(events: List[dict]) -> List[str]:
-    """
-    Turn a list of grouped events into display lines.
-
-    Example output line:
-        🔴 3:30 PM | USD: Advance GDP q/q, Core PCE Price Index m/m, Unemployment Claims
-        🟠 5:00 PM | USD: ISM Manufacturing PMI
-    """
-    lines = []
-    for e in events:
-        emoji    = "🔴" if e["impact"] == "red" else "🟠"
-        time_str = e["time_12h"]
-        names    = e["name"]          # already comma-joined by _extract_events_from_ff_text
-        lines.append(f"{emoji} {time_str} | {e['currency']}: {names}")
-    return lines
-
 
 class ChannelScraper:
     def __init__(self, config: dict, ai_engine: AIEngine, memory: MemoryManager):
@@ -656,9 +634,7 @@ class ChannelScraper:
                 if phash:
                     await self._mem.mark_image_seen(phash, source_channel)
                 log.info(f"📆 Weekly calendar posted → msg_id={sent.id}")
-
         else:
-            # ── Daily briefing ────────────────────────────────────────────────
             if await self._mem.has_daily_briefing(today_str):
                 log.info(f"[SKIP] Daily briefing already posted today ({today_str}).")
                 return
@@ -668,24 +644,25 @@ class ChannelScraper:
             if not result.get("approved"):
                 log.info(f"[SKIP] Daily FF image rejected: {result.get('reason')}")
                 return
-
-            raw_text = result.get("formatted_text", "").strip()
-            if not raw_text:
+            post_text = result.get("formatted_text", "").strip()
+            if not post_text:
                 return
+            post_text = _add_signature(post_text)
 
-            # ── Parse & group events from AI output ───────────────────────
-            events = _extract_events_from_ff_text(raw_text)
+            # DEBUG: log the raw AI output
+            log.info(f"📄 Raw AI output:\n{post_text}")
 
-            # ── Filter geopolitical events ────────────────────────────────
+            events = _extract_events_from_ff_text(post_text)
+
+            # Filter out geopolitical events
             filtered_events = []
             for e in events:
                 name_lower = e.get("name", "").lower()
                 if any(kw in name_lower for kw in GEOPOLITICAL_KEYWORDS):
-                    log.info(f"Removing geopolitical event: {e.get('name')}")
+                    log.info(f"Removing geopolitical event from calendar: {e.get('name')}")
                     continue
                 filtered_events.append(e)
             events = filtered_events
-
             if not events:
                 log.info("All events were geopolitical – skipping daily briefing.")
                 return
@@ -693,26 +670,21 @@ class ChannelScraper:
             self._todays_vip_events = self._select_vip_events(events)
             log.info(f"VIP reminder slots: {[e.get('name') for e in self._todays_vip_events]}")
 
-            # ── Build final post ──────────────────────────────────────────
-            # Header
-            title     = "📅 TODAY'S USD 🇺🇸 HIGH IMPACT NEWS"
-            date_line = _eat_now().strftime("%A, %B %d")   # e.g. "Thursday, April 30"
-
+            # Build final calendar text with proper spacing and date without trailing comma
+            title = "📅 TODAY'S USD 🇺🇸 HIGH IMPACT NEWS"
+            date_line = _eat_now().strftime("%A, %B %d")   # e.g., "Thursday, April 30"
             output_lines = [
                 title,
-                "",           # blank line after title
+                "",          # blank line after title
                 date_line,
-                "",           # blank line after date
+                "",          # blank line after date
             ]
-
-            # One line per time-slot — names already comma-joined
-            output_lines.extend(_format_calendar_lines(events))
-
-            # No "Be careful" line — intentionally omitted
+            for e in events:
+                emoji = "🔴" if e["impact"] == "red" else "🟠"
+                output_lines.append(f"{emoji} {e['time_12h']} | {e['currency']}: {e['name']}")
+            # No "Be careful" line
             post_text = "\n".join(output_lines)
             post_text = _add_signature(post_text)
-
-            log.info(f"📅 Final post preview:\n{post_text}")
 
             sent = await self._broadcast_file_with_caption(image_data, image_mime, post_text)
             if sent:
