@@ -1,10 +1,5 @@
 """
-ai_engine.py — Final version.
-- Calendar posts: NO hashtags, no year, only USD, 12‑hour AM/PM.
-- Rejects calendar images with >3 non‑USD events.
-- Geopolitical/FOMC exceptions for regular news.
-- US flag emoji for news posts.
-- Professional motivational lines for reminders.
+ai_engine.py — Final version with professional motivational lines and US flag emoji.
 """
 
 import asyncio
@@ -22,12 +17,10 @@ from groq import AsyncGroq
 
 log = logging.getLogger("ai_engine")
 
-# Base signature without bulb (bulb added randomly later)
 CHANNEL_SIGNATURE = "\n\n[Squad 4xx](https://t.me/Squad_4xx)"
 ALLOWED_HASHTAGS_SET = {"#XAUUSD", "#DXY", "#OIL"}
 
 def _add_us_flag_emoji(text: str) -> str:
-    """Add US flag emoji after first occurrence of US or USD in headline."""
     if not text:
         return text
     lines = text.split('\n')
@@ -40,7 +33,6 @@ def _add_us_flag_emoji(text: str) -> str:
     return '\n'.join(lines)
 
 def _add_signature(text: str) -> str:
-    """Append channel signature, randomly adding 💡 emoji with 30% probability."""
     text = text.strip()
     if "[Squad 4xx]" not in text:
         if random.random() < 0.3:
@@ -151,7 +143,7 @@ Be aggressive: if there is any reasonable chance they are the same, mark same_st
 Respond with JSON: {{"same_story": true, "confidence": 0.0-1.0, "reason": "..."}}
 """
 
-# ─── FOREXFACTORY PROMPTS (ONLY USD, 12‑hour AM/PM, NO YEAR, NO HASHTAGS) ────
+# ─── FOREXFACTORY PROMPTS ────────────────────────────────────────────────
 _FF_IMAGE_PROMPT = """
 You are analysing a ForexFactory economic calendar screenshot.
 
@@ -207,7 +199,6 @@ Otherwise {{"approved": false, "reason": "..."}}
 RESPOND WITH VALID JSON ONLY.
 """.strip()
 
-# Alert template without "NEWS:" header – professional style
 _ALERT_PROMPT_TEMPLATE = """
 You are a Senior Institutional Trader writing a pre-event warning alert.
 
@@ -252,35 +243,18 @@ def _b64(data: bytes) -> str:
 def _today_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-# ========== PROFESSIONAL MOTIVATIONAL LINES ==========
 def _get_motivational_line(event_name: str = "", fallback_index: int = 0) -> str:
-    """
-    Returns a motivational line tailored to the event type.
-    All lines are professional, capital-protection focused.
-    """
     name_lower = event_name.lower()
-    
-    # FOMC / Fed related
     if any(kw in name_lower for kw in ["fomc", "federal funds", "interest rate", "fed chair", "powell", "federal reserve"]):
         return "🏦 The Fed holds the keys – rate decisions can trigger violent moves. Protect your capital and respect the uncertainty."
-    
-    # Non-Farm Payrolls / Jobs
     if any(kw in name_lower for kw in ["non-farm", "nfp", "employment change", "payrolls", "jobless", "unemployment"]):
         return "📊 Jobs data regularly causes 50‑100 pip spikes. Don't gamble – secure profits and wait for clarity."
-    
-    # CPI / PCE / Inflation
     if any(kw in name_lower for kw in ["cpi", "consumer price", "inflation", "pce"]):
         return "📈 Inflation surprises can shred stops in seconds. Be extremely cautious – reduce size or stay flat."
-    
-    # GDP
     if "gdp" in name_lower:
         return "📉 GDP releases often create sharp two‑way reversals. Tighten your risk management or stay aside."
-    
-    # Geopolitical / Oil / War / Trump
     if any(kw in name_lower for kw in ["oil", "hormuz", "war", "iran", "trump", "geopolitical", "missile", "attack", "strike"]):
         return "🌍 Geopolitical spikes are fast and unforgiving. Move to safety – no new entries, protect what you have."
-    
-    # Fallback pool – rotating, still professional
     general_pool = [
         "🛡️ Market volatility ahead. Guard your account like it's irreplaceable – because it is. Stay safe. 🔒",
         "💰 One reckless trade during high‑impact news can erase weeks of gains. Be disciplined.",
@@ -536,7 +510,6 @@ class AIEngine:
             return self._fallback_alert(event, minutes_left, motivational_index)
 
     async def get_motivational_line(self, event_name: str, fallback_index: int = 0) -> str:
-        """Public wrapper for _get_motivational_line."""
         return _get_motivational_line(event_name, fallback_index)
 
     def _build_moderation_prompt(self, text: str) -> str:
