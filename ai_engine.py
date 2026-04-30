@@ -1,11 +1,17 @@
 """
-ai_engine.py — Final version with professional motivational lines.
+ai_engine.py — Final version.
+- Calendar posts: NO hashtags, no year, only USD, 12‑hour AM/PM.
+- Rejects calendar images with >3 non‑USD events.
+- Geopolitical/FOMC exceptions for regular news.
+- US flag emoji for news posts.
+- Professional motivational lines for reminders.
 """
 
 import asyncio
 import base64
 import json
 import logging
+import random
 import re
 import textwrap
 from datetime import datetime, timezone
@@ -16,10 +22,12 @@ from groq import AsyncGroq
 
 log = logging.getLogger("ai_engine")
 
-CHANNEL_SIGNATURE = "\n\n💡 [Squad 4xx](https://t.me/Squad_4xx)"
+# Base signature without bulb (bulb added randomly later)
+CHANNEL_SIGNATURE = "\n\n[Squad 4xx](https://t.me/Squad_4xx)"
 ALLOWED_HASHTAGS_SET = {"#XAUUSD", "#DXY", "#OIL"}
 
 def _add_us_flag_emoji(text: str) -> str:
+    """Add US flag emoji after first occurrence of US or USD in headline."""
     if not text:
         return text
     lines = text.split('\n')
@@ -30,6 +38,17 @@ def _add_us_flag_emoji(text: str) -> str:
     new_line = re.sub(r'\bUSD\b', 'USD 🇺🇸', new_line, count=1)
     lines[0] = new_line
     return '\n'.join(lines)
+
+def _add_signature(text: str) -> str:
+    """Append channel signature, randomly adding 💡 emoji with 30% probability."""
+    text = text.strip()
+    if "[Squad 4xx]" not in text:
+        if random.random() < 0.3:
+            signature = "\n\n💡 " + CHANNEL_SIGNATURE.lstrip("\n\n")
+        else:
+            signature = CHANNEL_SIGNATURE
+        text += signature
+    return text
 
 _SYSTEM_PROMPT = """
 You are AXIOM INTEL — a Senior Institutional Macro & Geopolitical news editor.
@@ -232,12 +251,6 @@ def _b64(data: bytes) -> str:
 
 def _today_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-
-def _add_signature(text: str) -> str:
-    text = text.strip()
-    if "💡 [Squad 4xx]" not in text:
-        text += CHANNEL_SIGNATURE
-    return text
 
 # ========== PROFESSIONAL MOTIVATIONAL LINES ==========
 def _get_motivational_line(event_name: str = "", fallback_index: int = 0) -> str:
@@ -523,7 +536,7 @@ class AIEngine:
             return self._fallback_alert(event, minutes_left, motivational_index)
 
     async def get_motivational_line(self, event_name: str, fallback_index: int = 0) -> str:
-        """Public method for scraper to get motivational line based on event type."""
+        """Public wrapper for _get_motivational_line."""
         return _get_motivational_line(event_name, fallback_index)
 
     def _build_moderation_prompt(self, text: str) -> str:
