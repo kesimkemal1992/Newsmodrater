@@ -1,10 +1,5 @@
 """
-ai_engine.py — Final version.
-- US flag emoji in calendar heading.
-- Random bulb emoji (30%) before signature.
-- Plain text signature link: [Squad 4xx](https://t.me/Squad_4xx)
-- Geopolitical/FOMC exceptions.
-- Professional motivational lines for reminders.
+ai_engine.py — Final version with US flag and plain signature link.
 """
 
 import asyncio
@@ -22,6 +17,7 @@ from groq import AsyncGroq
 
 log = logging.getLogger("ai_engine")
 
+# Plain link signature (no bulb by default, but you can easily add random bulb later)
 CHANNEL_SIGNATURE = "\n\n[Squad 4xx](https://t.me/Squad_4xx)"
 ALLOWED_HASHTAGS_SET = {"#XAUUSD", "#DXY", "#OIL"}
 
@@ -40,11 +36,7 @@ def _add_us_flag_emoji(text: str) -> str:
 def _add_signature(text: str) -> str:
     text = text.strip()
     if "[Squad 4xx]" not in text:
-        if random.random() < 0.3:
-            signature = "\n\n💡 " + CHANNEL_SIGNATURE.lstrip("\n\n")
-        else:
-            signature = CHANNEL_SIGNATURE
-        text += signature
+        text += CHANNEL_SIGNATURE
     return text
 
 _SYSTEM_PROMPT = """
@@ -378,7 +370,6 @@ class AIEngine:
             log.info(f"Gemini → approved={verdict['approved']} | {verdict.get('reason', '')}")
             if verdict.get("approved") and verdict.get("formatted_text"):
                 verdict["formatted_text"] = _build_post_body(verdict["formatted_text"])
-                # Add US flag only for news posts (not calendar)
                 if not verdict["formatted_text"].startswith("📅 TODAY'S USD HIGH IMPACT"):
                     verdict["formatted_text"] = _add_us_flag_emoji(verdict["formatted_text"])
             return verdict
