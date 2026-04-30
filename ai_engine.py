@@ -1,10 +1,10 @@
 """
 ai_engine.py — Final version.
-- Calendar posts: NO hashtags.
+- Calendar posts: NO hashtags, no year, only USD, 12‑hour AM/PM.
+- Rejects calendar images with >3 non‑USD events (full calendar).
 - News posts: dynamic hashtags (#XAUUSD, #DXY, #OIL) based on affected assets.
 - Allows actual released numbers, bans forecast/previous/TA/signals.
-- Geopolitical exception for world leaders.
-- ForexFactory: USD only, original time, 12‑hour AM/PM, no year, no hashtags.
+- Geopolitical and FOMC exceptions.
 """
 
 import asyncio
@@ -21,9 +21,7 @@ from groq import AsyncGroq
 
 log = logging.getLogger("ai_engine")
 
-CHANNEL_SIGNATURE = "\n\n[Squad 4xx](https://t.me/Squad_4xx)"
-
-# Allowed hashtags for news posts (AI chooses which ones)
+CHANNEL_SIGNATURE = "\n\n💡 [Squad 4xx](https://t.me/Squad_4xx)"
 ALLOWED_HASHTAGS_SET = {"#XAUUSD", "#DXY", "#OIL"}
 
 def _add_us_flag_emoji(text: str) -> str:
@@ -53,6 +51,16 @@ Any statement from a world leader (e.g., Trump, Biden, Putin, Xi) that affects:
 These are HIGH IMPACT geopolitical events, even if posted on social media.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🔥 FOMC / CENTRAL BANK EXCEPTION (ALWAYS APPROVE)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Any official announcement or news about:
+- Federal Open Market Committee (FOMC)
+- Federal Funds Rate / Interest Rate Decision
+- Fed Chair Powell speech
+- FOMC Statement or Minutes
+These are HIGH IMPACT macroeconomic events. Always approve even if they contain numbers like "rate at 5.25%". Do NOT reject as "forecast" or "commentary".
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 YOUR ONLY JOB:
 Take the source content, verify its relevance, and format it cleanly.
 Do NOT speculate. Do NOT add analysis beyond the facts.
@@ -74,7 +82,7 @@ CRITICAL FORMATTING RULES:
 - Do NOT add signature (added automatically).
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-REJECT IF ANY OF THESE APPLY (EXCEPT the Geopolitical Exception):
+REJECT IF ANY OF THESE APPLY (EXCEPT the Geopolitical/FOMC Exceptions):
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 1. SIGNALS       — Buy/Sell/Long/Short/Entry/TP/SL/price targets
 2. CHART / TA    — Technical analysis, patterns, indicators
@@ -129,7 +137,8 @@ Be aggressive: if there is any reasonable chance they are the same, mark same_st
 Respond with JSON: {{"same_story": true, "confidence": 0.0-1.0, "reason": "..."}}
 """
 
-# ─── FOREXFACTORY PROMPTS (NO HASHTAGS, NO YEAR, NO FORECAST) ────────────────
+# ─── FOREXFACTORY PROMPTS (ONLY USD, 12‑hour AM/PM, NO YEAR, NO HASHTAGS) ────
+# This prompt now includes a check for non‑USD event count (>3 → reject)
 _FF_IMAGE_PROMPT = """
 You are analysing a ForexFactory economic calendar screenshot.
 
@@ -138,15 +147,18 @@ TODAY'S DATE: {today_date}  (the year is provided but DO NOT include it in the o
 TASKS:
 1. Confirm this is a real ForexFactory calendar image (not meme/chart).
 2. Confirm it shows TODAY's date – reject otherwise.
-3. Extract **only USD high‑impact (Red 🔴) and medium‑impact (Orange 🟠) events** visible.
-4. **Keep the original time as shown in the screenshot** – do NOT convert time zones.
-5. Convert the time to **12‑hour AM/PM** format if needed.
-6. Format a clean daily briefing – **NO forecast, NO previous data**.
-7. **DO NOT include the year** in the date line (only day and month, e.g., "Wednesday, April 29").
-8. **DO NOT add any hashtags** – no #XAUUSD, no #DXY, no #OIL, absolutely none.
+3. **Count the number of non‑USD event rows** visible (events where the currency is not USD, e.g., EUR, GBP, JPY, etc.).
+   - If there are **more than 3** non‑USD events → reject the image (set approved=false).
+   - If there are 0–3 non‑USD events, proceed.
+4. Extract **only USD high‑impact (Red 🔴) and medium‑impact (Orange 🟠) events** visible.
+5. **Keep the original time as shown in the screenshot** – do NOT convert time zones.
+6. Convert the time to **12‑hour AM/PM** format if needed. Do NOT show 24‑hour times.
+7. Format a clean daily briefing – **NO forecast, NO previous data**.
+8. **DO NOT include the year** in the date line (only day and month, e.g., "Wednesday, April 29").
+9. **DO NOT add any hashtags** – no #XAUUSD, no #DXY, no #OIL, absolutely none.
 
 STRICT RULES:
-- Only USD events.
+- Only USD events in the final formatted text.
 - Only 🔴 and 🟠 impact.
 - Times in 12‑hour AM/PM, no timezone label.
 - NO forecast values, NO previous values.
@@ -154,10 +166,10 @@ STRICT RULES:
 - Plain text only, no asterisks, no bold.
 - Do NOT add signature.
 
-If not valid:
-{{"approved": false, "reason": "not a valid ForexFactory today image"}}
+If the image is not a valid ForexFactory calendar, or if it shows more than 3 non‑USD events, respond with:
+{{"approved": false, "reason": "not a valid ForexFactory today image (too many other currencies or not FF)"}}
 
-If valid, respond with JSON like (note: no hashtags):
+If valid (0–3 non‑USD events), respond with JSON like (note: no hashtags, no year):
 {{"approved": true, "reason": "valid FF today image", "formatted_text": "📅 TODAY'S USD HIGH IMPACT NEWS\\nWednesday, April 29\\n\\n🔴 03:30 PM | USD: Non-Farm Payrolls\\n🟠 05:00 PM | USD: ISM PMI\\n\\nBe careful during these releases."}}
 
 RESPOND WITH VALID JSON ONLY.
@@ -165,7 +177,7 @@ RESPOND WITH VALID JSON ONLY.
 
 _FF_WEEKLY_IMAGE_PROMPT = """
 You are analysing a ForexFactory calendar for the weekly outlook.
-No conversion of time zones. Use 12‑hour AM/PM.
+No conversion of time zones. Use 12‑hour AM/PM only.
 Only USD high‑impact (🔴) and medium‑impact (🟠) events.
 **NO forecast, NO previous data.**
 **Do NOT include the year** in dates (use "Monday — Apr 28").
@@ -199,13 +211,14 @@ Name: {event_name}
 Currency: {currency}
 Time: {time_12h}
 Impact: {impact_emoji}
+Minutes left: {minutes_left}
 
 Motivational closing line (copy exactly):
 {motivational_line}
 
 Write EXACT format:
 
-🚨 ALERT: 10 MINUTES REMAINING
+🚨 ALERT: {minutes_left} MINUTES REMAINING
 
 NEWS: {impact_emoji} {event_name}
 TIME: {time_12h}
@@ -228,7 +241,7 @@ def _today_str() -> str:
 
 def _add_signature(text: str) -> str:
     text = text.strip()
-    if "[Squad 4xx]" not in text:
+    if "💡 [Squad 4xx]" not in text:
         text += CHANNEL_SIGNATURE
     return text
 
@@ -287,24 +300,13 @@ def _validate_and_clean(data: dict) -> dict:
     data.setdefault("confidence", 0.5)
 
     if data.get("formatted_text"):
-        # Remove asterisks
         data["formatted_text"] = data["formatted_text"].replace("*", "")
-        # Remove NOTE lines
         data["formatted_text"] = re.sub(r"📌\s*(NOTE|MARKET STATUS|STATUS)[^\n]*\n?", "", data["formatted_text"]).strip()
-        # For news posts (not calendar), we keep allowed hashtags; for calendar posts we remove all hashtags.
-        # Since calendar posts already have no hashtags (by prompt), we just ensure any stray hashtags are removed.
-        # We'll use a flag: if the text contains "TODAY'S USD HIGH IMPACT" or "WEEKLY HIGH IMPACT", it's a calendar post.
-        # Safer: remove all hashtags from calendar posts, but keep dynamic ones for news.
-        # We'll keep all hashtags that are in ALLOWED_HASHTAGS_SET, but for calendar posts we don't want any.
-        # However, since the prompts for calendar explicitly forbid hashtags, we can simply remove any hashtags that appear.
-        # To be safe, we remove all hashtags from every post that contains "TODAY'S USD HIGH IMPACT" (calendar daily) or "WEEKLY HIGH IMPACT" (calendar weekly).
         text = data["formatted_text"]
         if "TODAY'S USD HIGH IMPACT" in text or "WEEKLY HIGH IMPACT" in text:
-            # Calendar post: remove all hashtags
             text = re.sub(r"#\w+", "", text).strip()
             data["formatted_text"] = text
         else:
-            # News post: keep only allowed hashtags
             hashtags = re.findall(r"#\w+", text)
             allowed_hashtags = [h for h in hashtags if h in ALLOWED_HASHTAGS_SET]
             text = re.sub(r"#\w+", "", text).strip()
@@ -312,7 +314,6 @@ def _validate_and_clean(data: dict) -> dict:
                 text = text + "\n\n" + " ".join(allowed_hashtags)
             data["formatted_text"] = text
 
-    # Hard reject if signal keyword appears in output
     if data.get("approved") and _signal_hit(data.get("formatted_text", "")):
         log.warning("Signal keyword in output — hard reject.")
         data["approved"] = False
@@ -474,7 +475,7 @@ class AIEngine:
             log.error(f"Both engines failed for FF image: {exc}")
             return {"approved": False, "reason": "AI engines unavailable for image analysis."}
 
-    async def generate_alert(self, event: dict, motivational_index: int = 0) -> str:
+    async def generate_alert(self, event: dict, minutes_left: int, motivational_index: int = 0) -> str:
         impact_emoji = "🔴" if event.get("impact") == "red" else "🟠"
         motivational_line = _get_motivational_line(motivational_index)
         prompt = _ALERT_PROMPT_TEMPLATE.format(
@@ -482,11 +483,12 @@ class AIEngine:
             currency=event.get("currency", "USD"),
             time_12h=event.get("time_12h", "—"),
             impact_emoji=impact_emoji,
+            minutes_left=minutes_left,
             motivational_line=motivational_line,
         )
         try:
             result = await asyncio.wait_for(self._gemini_text_call(prompt), timeout=30)
-            log.info(f"Alert generated for: {event.get('name')}")
+            log.info(f"Alert generated for: {event.get('name')} ({minutes_left} min)")
             result = _add_us_flag_emoji(result)
             return _add_signature(_strip_asterisks(result.strip()))
         except Exception as exc:
@@ -497,7 +499,7 @@ class AIEngine:
             return _add_signature(_strip_asterisks(result.strip()))
         except Exception as exc:
             log.error(f"Both engines failed for alert — using fallback.")
-            return self._fallback_alert(event, motivational_index)
+            return self._fallback_alert(event, minutes_left, motivational_index)
 
     def _build_moderation_prompt(self, text: str) -> str:
         return textwrap.dedent(f"""
@@ -548,11 +550,11 @@ class AIEngine:
         return resp.choices[0].message.content
 
     @staticmethod
-    def _fallback_alert(event: dict, motivational_index: int = 0) -> str:
+    def _fallback_alert(event: dict, minutes_left: int, motivational_index: int = 0) -> str:
         emoji = "🔴" if event.get("impact") == "red" else "🟠"
         line = _get_motivational_line(motivational_index)
         text = (
-            f"🚨 ALERT: 10 MINUTES REMAINING\n\n"
+            f"🚨 ALERT: {minutes_left} MINUTES REMAINING\n\n"
             f"NEWS: {emoji} {event.get('name', 'Unknown Event')}\n"
             f"TIME: {event.get('time_12h', '—')}\n\n"
             f"REQUIRED ACTION:\n"
@@ -575,17 +577,14 @@ def _reject(reason: str, issue: str, confidence: float = 1.0) -> dict:
     }
 
 def _build_post_body(text: str) -> str:
-    """Final clean: removes stray year, adds signature, does NOT add fixed hashtags (AI already handled)."""
     if not text:
         return ""
     text = text.replace("*", "")
     text = re.sub(r"📌\s*(NOTE|MARKET STATUS|STATUS)[^\n]*\n?", "", text).strip()
-    # Remove any standalone 4-digit year from last 3 lines
     lines = text.split('\n')
     for i in range(max(0, len(lines)-3), len(lines)):
         lines[i] = re.sub(r'\b\d{4}\b', '', lines[i])
     text = '\n'.join(lines)
     text = re.sub(r'\n\s*\n', '\n\n', text).strip()
-    # Add signature
     text = _add_signature(text)
     return text
