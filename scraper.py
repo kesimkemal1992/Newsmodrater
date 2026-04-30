@@ -1,9 +1,9 @@
 """
 scraper.py — AXIOM INTEL channel scraper and forwarder.
 - Only USD high‑impact (🔴) events trigger reminders (no 🟠)
-- Same‑time events grouped in calendar caption
-- Reminders reply to daily briefing post
-- Professional motivational lines from ai_engine
+- Geopolitical events are filtered out from daily calendar briefing.
+- Reminders reply to daily briefing post.
+- Professional motivational lines from ai_engine.
 """
 
 import asyncio
@@ -69,15 +69,25 @@ _HIGH_IMPACT_KEYWORDS = [
     "ism manufacturing", "ism non-manufacturing"
 ]
 
+# Geopolitical keywords to filter out from calendar briefing
+GEOPOLITICAL_KEYWORDS = [
+    "trump", "iran", "hormuz", "war", "missile", "strike", "attack",
+    "geopolitical", "oil supply", "ukraine", "russia", "biden", "putin", "xi"
+]
+
 def _is_fomc_event(name: str) -> bool:
     n = name.lower()
     return any(kw in n for kw in _FOMC_KEYWORDS)
 
 def _is_reminder_eligible(event: dict) -> bool:
-    # Only red impact (no orange)
+    # Only red impact
     if event.get("impact") != "red":
         return False
     name_lower = event.get("name", "").lower()
+    # Exclude geopolitical events (no reminder for these)
+    if any(kw in name_lower for kw in GEOPOLITICAL_KEYWORDS):
+        return False
+    # Only high-impact economic events
     for kw in _HIGH_IMPACT_KEYWORDS:
         if kw in name_lower:
             return True
@@ -139,7 +149,6 @@ def _extract_events_from_ff_text(text: str) -> List[dict]:
         if m:
             emoji, time_12h, currency, name = m.groups()
             impact = "red" if emoji == "🔴" else "orange"
-            # convert 12h to 24h for internal sorting/reminder
             try:
                 dt = datetime.strptime(time_12h.strip(), "%I:%M %p")
                 time_24h = dt.strftime("%H:%M")
@@ -163,7 +172,6 @@ def _extract_events_from_ff_text(text: str) -> List[dict]:
             grouped[key]["name"] = [e["name"]]
         else:
             grouped[key]["name"].append(e["name"])
-    # Convert back to list with combined names
     result = []
     for key, e in grouped.items():
         e["name"] = ", ".join(e["name"]) if isinstance(e["name"], list) else e["name"]
@@ -505,35 +513,43 @@ class ChannelScraper:
                 return
             post_text = _add_signature(post_text)
 
-            # Extract events with grouping (same time)
             events = _extract_events_from_ff_text(post_text)
+
+            # --- Filter out geopolitical events from the calendar briefing ---
+            filtered_events = []
+            for e in events:
+                name_lower = e.get("name", "").lower()
+                if any(kw in name_lower for kw in GEOPOLITICAL_KEYWORDS):
+                    log.info(f"Removing geopolitical event from calendar: {e.get('name')}")
+                    continue
+                filtered_events.append(e)
+            events = filtered_events
+
+            if not events:
+                log.info("All events were geopolitical – skipping daily briefing.")
+                return
+            # ----------------------------------------------------------------
+
             self._todays_vip_events = self._select_vip_events(events)
             log.info(f"VIP reminder slots: {[e.get('name') for e in self._todays_vip_events]}")
 
-            # Reconstruct the calendar text with grouped events
+            # Rebuild calendar text with filtered events (grouped)
             lines = post_text.split('\n')
-            new_lines = []
-            for line in lines:
-                if line.startswith(("🔴", "🟠")):
-                    # Replace line with grouped version? Already grouped in events, we need to reformat.
-                    # Simpler: we already have grouped events, rebuild the calendar block.
-                    pass
-            # Actually, post_text already contains the raw AI output. We'll replace it with our grouped version.
-            grouped_lines = []
-            for e in events:
-                grouped_lines.append(f"{e['impact_emoji']} {e['time_12h']} | {e['currency']}: {e['name']}")
-            # Keep header and footer
             header = []
             footer = []
-            in_events = False
+            in_events_section = False
             for line in lines:
                 if line.startswith(("🔴", "🟠")):
-                    in_events = True
-                if not in_events and line.strip():
+                    in_events_section = True
+                if not in_events_section and line.strip():
                     header.append(line)
                 if line.startswith("Be careful") or line.startswith("#") or line.startswith("💡"):
                     footer.append(line)
-            new_calendar_text = "\n".join(header + grouped_lines + footer)
+            event_lines = []
+            for e in events:
+                emoji = "🔴" if e.get("impact") == "red" else "🟠"
+                event_lines.append(f"{emoji} {e['time_12h']} | {e['currency']}: {e['name']}")
+            new_calendar_text = "\n".join(header + event_lines + footer)
             post_text = new_calendar_text
 
             sent = await self._broadcast_file_with_caption(image_data, image_mime, post_text)
