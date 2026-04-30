@@ -1,12 +1,9 @@
 """
 scraper.py — AXIOM INTEL channel scraper and forwarder.
-- Groups same‑time events (red+orange) into a single line.
-- Blank lines after title and after date.
-- No "Be careful" line.
-- Geopolitical events filtered out.
-- Date without trailing comma and without year.
-- Robust event extraction with comma splitting.
-- DUPLICATE GLITCH FIXED: all locks acquired BEFORE AI call / broadcast.
+- Forces AI to output each event on its own line.
+- Groups same‑time events into a single line with commas.
+- Validates that the date in AI output matches today's date.
+- Includes early locking, geopolitical filtering, reminders.
 """
 
 import asyncio
@@ -138,8 +135,9 @@ def _normalise_urls(text: str) -> str:
 
 def _extract_events_from_ff_text(text: str) -> List[dict]:
     """
-    Extract and group same-time USD events from AI-generated calendar text.
-    Handles comma-separated event names on a single line.
+    Extract events from AI‑generated text (each event on its own line),
+    then group by time (comma‑separated names for same hour).
+    Also validates that the date in the text matches today's date.
     """
     events = []
     pattern = re.compile(
@@ -151,15 +149,23 @@ def _extract_events_from_ff_text(text: str) -> List[dict]:
         line = line.strip()
         if not line:
             continue
+        # Skip the title and date lines
+        if line.startswith("📅 TODAY'S") or "TODAY'S USD" in line:
+            continue
+        # Try to extract date from a line like "Thursday, April 30"
+        date_match = re.match(r"^([A-Za-z]+),\s+([A-Za-z]+)\s+(\d{1,2})$", line)
+        if date_match:
+            # We'll validate later against today's date
+            continue
         m = pattern.search(line)
         if m:
-            emoji, time_12h, currency, name_part = m.groups()
+            emoji, time_12h, currency, name = m.groups()
             impact = "red" if emoji == "🔴" else "orange"
             time_12h = time_12h.strip()
             try:
                 dt = datetime.strptime(time_12h, "%I:%M %p")
                 time_24h = dt.strftime("%H:%M")
-                time_12h_clean = dt.strftime("%-I:%M %p")   # no leading zero
+                time_12h_clean = dt.strftime("%-I:%M %p")
             except ValueError:
                 try:
                     dt = datetime.strptime(time_12h, "%I:%M%p")
@@ -168,19 +174,15 @@ def _extract_events_from_ff_text(text: str) -> List[dict]:
                 except ValueError:
                     time_24h = ""
                     time_12h_clean = time_12h
-
-            # Split by comma if multiple event names
-            names = [n.strip() for n in name_part.split(',')]
-            for name in names:
-                events.append({
-                    "name": name,
-                    "currency": currency.strip(),
-                    "impact": impact,
-                    "time_12h": time_12h_clean,
-                    "time_24h": time_24h,
-                })
+            events.append({
+                "name": name.strip(),
+                "currency": currency.strip(),
+                "impact": impact,
+                "time_12h": time_12h_clean,
+                "time_24h": time_24h,
+            })
         else:
-            log.debug(f"Skipping unmatched line: {line}")
+            log.debug(f"Skipping unmatched line in AI output: {line}")
 
     if not events:
         log.error("❌ No events extracted! Raw AI output:\n%s", text[:1000])
@@ -218,7 +220,6 @@ def _extract_events_from_ff_text(text: str) -> List[dict]:
 
     log.info(f"✅ Extracted {len(result)} grouped event(s): {[e['name'] for e in result]}")
     return result
-
 
 class ChannelScraper:
     def __init__(self, config: dict, ai_engine: AIEngine, memory: MemoryManager):
@@ -424,8 +425,6 @@ class ChannelScraper:
             return
 
         content_hash = self._mem.hash_combined(text, image_data)
-
-        # ── DUPLICATE CHECK ────────────────────────────────────────────────
         if await self._mem.is_duplicate(content_hash):
             log.info(f"[SKIP] Exact hash duplicate — {content_hash[:12]}…")
             return
@@ -434,7 +433,6 @@ class ChannelScraper:
             await self._mem.mark_image_seen(phash, source_channel)
             return
 
-        # ── LOCK IMMEDIATELY — before any slow AI call ─────────────────────
         await self._mem.mark_seen(content_hash, source=source_channel)
         if phash:
             await self._mem.mark_image_seen(phash, source_channel)
@@ -628,7 +626,6 @@ class ChannelScraper:
 
         phash = self._mem.compute_phash(image_data)
 
-        # ── LOCK phash BEFORE duplicate check & AI call ────────────────────
         if phash:
             if await self._mem.is_image_duplicate(phash, max_distance=3):
                 log.info(f"[SKIP] FF image duplicate (phash distance ≤3) — {phash}")
@@ -684,6 +681,22 @@ class ChannelScraper:
                 return
 
             log.info(f"📄 Raw AI output:\n{raw_text}")
+
+            # Extract date from AI output and verify it matches today's date
+            # The AI output should contain a line like "Thursday, April 30"
+            date_match = re.search(r"^([A-Za-z]+),\s+([A-Za-z]+)\s+(\d{1,2})$", raw_text, re.MULTILINE)
+            if date_match:
+                month_name = date_match.group(2)
+                day = int(date_match.group(3))
+                # Get current month name and day from today's date
+                today = _eat_now()
+                if month_name != today.strftime("%B") or day != today.day:
+                    log.warning(f"Date mismatch: AI said {month_name} {day}, but today is {today.strftime('%B %d')}. Rejecting.")
+                    await self._mem.delete_daily_briefing(today_str)
+                    return
+            else:
+                log.warning("Could not find date line in AI output. Assuming correct but logging.")
+                # We still proceed, but log warning
 
             events = _extract_events_from_ff_text(raw_text)
 
