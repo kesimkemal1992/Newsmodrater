@@ -1,5 +1,5 @@
 """
-ai_engine.py — Final version with always-visible channel signature and random bulb.
+ai_engine.py — Final version with US flag in calendar and random bulb signature.
 """
 
 import asyncio
@@ -35,18 +35,14 @@ def _add_us_flag_emoji(text: str) -> str:
     return '\n'.join(lines)
 
 def _add_signature(text: str) -> str:
-    """Append channel signature. Always adds the signature if not already present.
-    Randomly adds a bulb emoji (30% chance) before the signature."""
+    """Append channel signature, randomly adding 💡 emoji with 30% probability."""
     text = text.strip()
-    # If signature already exists at the end, do nothing
-    if text.endswith("[Squad 4xx](https://t.me/Squad_4xx)"):
-        return text
-    # Remove any trailing whitespace and add newline then signature
-    if random.random() < 0.3:
-        signature = "\n\n💡 " + CHANNEL_SIGNATURE.lstrip("\n\n")
-    else:
-        signature = CHANNEL_SIGNATURE
-    text += signature
+    if "[Squad 4xx]" not in text:
+        if random.random() < 0.3:
+            signature = "\n\n💡 " + CHANNEL_SIGNATURE.lstrip("\n\n")
+        else:
+            signature = CHANNEL_SIGNATURE
+        text += signature
     return text
 
 _SYSTEM_PROMPT = """
@@ -250,7 +246,6 @@ def _b64(data: bytes) -> str:
 def _today_str() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
-# ========== PROFESSIONAL MOTIVATIONAL LINES ==========
 def _get_motivational_line(event_name: str = "", fallback_index: int = 0) -> str:
     name_lower = event_name.lower()
     if any(kw in name_lower for kw in ["fomc", "federal funds", "interest rate", "fed chair", "powell", "federal reserve"]):
@@ -381,7 +376,7 @@ class AIEngine:
             log.info(f"Gemini → approved={verdict['approved']} | {verdict.get('reason', '')}")
             if verdict.get("approved") and verdict.get("formatted_text"):
                 verdict["formatted_text"] = _build_post_body(verdict["formatted_text"])
-                # Add US flag emoji only for news, not for calendar briefings
+                # Add US flag emoji for news posts (calendar posts start with "📅 TODAY'S USD HIGH IMPACT")
                 if not verdict["formatted_text"].startswith("📅 TODAY'S USD HIGH IMPACT"):
                     verdict["formatted_text"] = _add_us_flag_emoji(verdict["formatted_text"])
             return verdict
@@ -467,9 +462,8 @@ class AIEngine:
             data = _parse_json(resp.text)
             log.info(f"FF image → approved={data.get('approved')} | {data.get('reason', '')}")
             if data.get("approved") and data.get("formatted_text"):
-                # Do NOT add US flag emoji for calendar posts
-                # data["formatted_text"] = _add_us_flag_emoji(data["formatted_text"])
-                pass
+                # Add US flag emoji for calendar heading
+                data["formatted_text"] = _add_us_flag_emoji(data["formatted_text"])
             return data
         except Exception as exc:
             log.warning(f"Gemini FF failed ({exc}) — trying Groq …")
@@ -489,7 +483,8 @@ class AIEngine:
             )
             data = _parse_json(resp.choices[0].message.content)
             log.info(f"Groq FF → approved={data.get('approved')}")
-            # Do NOT add US flag emoji for calendar posts
+            if data.get("approved") and data.get("formatted_text"):
+                data["formatted_text"] = _add_us_flag_emoji(data["formatted_text"])
             return data
         except Exception as exc:
             log.error(f"Both engines failed for FF image: {exc}")
