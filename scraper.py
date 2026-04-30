@@ -1,7 +1,9 @@
-
 """
 scraper.py — AXIOM INTEL channel scraper and forwarder.
-Hardened duplicate protection, max 1 reminder per day.
+- Accepts ForexFactory calendar images as posted (no cropping by bot).
+- Caption only lists USD high‑impact (🔴) and medium‑impact (🟠) events.
+- Times always 12‑hour AM/PM, no timezone labels.
+- Once per day. Duplicate prevention via phash and daily flag.
 """
 
 import asyncio
@@ -32,6 +34,7 @@ _FF_CAPTION_KEYWORDS = (
     "forexfactory", "forex factory", "calendar", "economic calendar",
     "high impact", "impact news", "weekly news", "today news",
     "today's news", "weekly calendar", "this week",
+    "fomc", "federal funds rate", "interest rate decision"
 )
 
 _PRIORITY_KEYWORDS = [
@@ -52,9 +55,18 @@ _FOMC_KEYWORDS = (
 _GOLD_KEYWORDS = ("gold", "xau")
 
 _UNIQUE_EVENT_NAMES = [
-    "federal funds rate", "fomc", "interest rate decision",
+    "federal funds rate", "interest rate decision",
     "non-farm payroll", "nfp", "consumer price index", "cpi",
     "pce", "gdp", "fed chair", "powell speaks"
+]
+
+_HIGH_IMPACT_KEYWORDS = [
+    "fomc", "federal funds rate", "interest rate decision",
+    "non-farm payroll", "nfp", "consumer price index", "cpi",
+    "pce", "core pce", "gdp", "advance gdp", "preliminary gdp",
+    "fed chair", "powell speaks", "unemployment rate", "retail sales",
+    "ism manufacturing", "ism non-manufacturing", "philly fed",
+    "empire state", "durable goods", "housing starts"
 ]
 
 def _is_fomc_event(name: str) -> bool:
@@ -64,17 +76,17 @@ def _is_fomc_event(name: str) -> bool:
 def _is_reminder_eligible(event: dict) -> bool:
     if event.get("impact") != "red":
         return False
-    if _is_fomc_event(event.get("name", "")):
-        return True
-    currency = event.get("currency", "").upper().strip()
     name_lower = event.get("name", "").lower()
+    for kw in _HIGH_IMPACT_KEYWORDS:
+        if kw in name_lower:
+            return True
+    currency = event.get("currency", "").upper().strip()
     is_usd = currency == "USD"
     is_gold = any(kw in name_lower for kw in _GOLD_KEYWORDS)
     if not (is_usd or is_gold):
         return False
     forecast = event.get("forecast", "").strip()
     previous = event.get("previous", "").strip()
-    # For USD/Gold events, require both forecast and previous to be non-empty.
     return bool(forecast and forecast != "—" and previous and previous != "—")
 
 def _is_priority_event(name: str) -> bool:
@@ -399,7 +411,9 @@ class ChannelScraper:
     async def _is_similar_to_recent(self, new_text: str, new_image: Optional[bytes], new_phash: Optional[str] = None) -> bool:
         try:
             recent = await self._mem.get_recent_posts(limit=150)
-            for old_text, old_phash in recent:
+            today_date = _eat_now().date()
+            for old_text, old_phash, old_date_str in recent:
+                old_date = datetime.fromisoformat(old_date_str).date()
                 if new_phash and old_phash:
                     distance = self._mem.hamming_distance(new_phash, old_phash)
                     if distance <= 3:
@@ -410,8 +424,11 @@ class ChannelScraper:
                     old_lower = old_text.lower()
                     for name in _UNIQUE_EVENT_NAMES:
                         if name in new_lower and name in old_lower:
-                            log.info(f"Matched critical event name '{name}' – preventing duplicate")
-                            return True
+                            if old_date == today_date:
+                                log.info(f"Matched critical event name '{name}' on same day – preventing duplicate")
+                                return True
+                            else:
+                                log.info(f"Event name '{name}' matched but from different day – allowing")
                     same = await self._ai.is_same_story(
                         text_a=new_text[:500],
                         text_b=old_text[:500],
@@ -434,12 +451,6 @@ class ChannelScraper:
             log.info(f"[SKIP] FF image duplicate (phash distance ≤3) — {phash}")
             return
 
-        if not is_weekly:
-            dummy_text = f"FOMC {today_display}"
-            if await self._is_similar_to_recent(dummy_text, None, None):
-                log.info(f"[SKIP] FF image – event names already covered by recent text post.")
-                return
-
         if is_weekly:
             now = _eat_now()
             week_start = now + timedelta(days=(7 - now.weekday()))
@@ -461,6 +472,7 @@ class ChannelScraper:
             if not post_text:
                 return
             post_text = _add_signature(post_text)
+            # No cropping – use original image
             sent = await self._broadcast_file_with_caption(image_data, image_mime, post_text)
             if sent:
                 await self._mem.save_weekly_posted(week_key)
@@ -486,6 +498,7 @@ class ChannelScraper:
             self._todays_vip_events = self._select_vip_events(events)
             log.info(f"VIP reminder slots: {[e.get('name') for e in self._todays_vip_events]}")
 
+            # Use original image as provided (already cropped by source channel)
             sent = await self._broadcast_file_with_caption(image_data, image_mime, post_text)
             if sent:
                 await self._mem.save_daily_briefing(today_str, sent.id, events)
@@ -513,7 +526,7 @@ class ChannelScraper:
             return []
         def sort_key(e):
             return (0 if _is_priority_event(e.get("name", "")) else 1, e.get("time_24h", "99:99"))
-        vip = sorted(eligible, key=sort_key)[:2]  # limited to 2, but we will only send at most 1 per day
+        vip = sorted(eligible, key=sort_key)[:2]
         log.info(f"Top 2 VIP: {[e.get('name') for e in vip]}")
         return vip
 
@@ -521,7 +534,7 @@ class ChannelScraper:
         today_str = _eat_today_str()
         reminder_count = await self._mem.get_reminder_count_today(today_str)
         log.info(f"Reminder status: {reminder_count}/1 sent today. Remaining slots: {1 - reminder_count}")
-        if reminder_count >= 1:   # Only ONE reminder per day
+        if reminder_count >= 1:
             return
         briefing_msg_id = await self._mem.get_daily_briefing_msg_id(today_str)
         if not briefing_msg_id or briefing_msg_id == -1:
@@ -557,15 +570,16 @@ class ChannelScraper:
                 continue
             minutes_until = (event_time - now_naive).total_seconds() / 60
             log.info(f"⏰ Pre-reminder: {event.get('name')} at {event.get('time_12h')} - {minutes_until:.0f} minutes from now")
-            if 8 <= minutes_until <= 12:
-                await self._send_reminder(event, event_key, briefing_msg_id, today_str)
+            if 9 <= minutes_until <= 11:
+                minutes_left = int(round(minutes_until))
+                await self._send_reminder(event, event_key, briefing_msg_id, today_str, minutes_left)
                 slots_left -= 1
                 await asyncio.sleep(2)
 
-    async def _send_reminder(self, event: dict, event_key: str, reply_to_msg_id: int, today_str: str):
-        log.info(f"⏰ Sending 10-min reminder for {event.get('name')} at {event.get('time_12h')}")
+    async def _send_reminder(self, event: dict, event_key: str, reply_to_msg_id: int, today_str: str, minutes_left: int):
+        log.info(f"⏰ Sending {minutes_left}-min reminder for {event.get('name')} at {event.get('time_12h')}")
         mot_index = await self._mem.get_and_increment_motivational_index()
-        alert_text = await self._ai.generate_alert(event, motivational_index=mot_index)
+        alert_text = await self._ai.generate_alert(event, minutes_left, mot_index)
         if not alert_text:
             log.error(f"Failed to generate alert for {event.get('name')}")
             return
