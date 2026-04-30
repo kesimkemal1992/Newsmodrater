@@ -4,6 +4,8 @@ scraper.py — AXIOM INTEL channel scraper and forwarder.
 - Geopolitical events are filtered out from daily calendar briefing.
 - Reminders reply to daily briefing post.
 - Professional motivational lines from ai_engine.
+- Strong duplicate protection for calendar images (phash + daily limit + event grouping)
+- Negative minutes check – no reminder for past events.
 """
 
 import asyncio
@@ -60,7 +62,6 @@ _UNIQUE_EVENT_NAMES = [
     "pce", "gdp", "fed chair", "powell speaks"
 ]
 
-# Only truly market-moving red events (high liquidity, high volatility)
 _HIGH_IMPACT_KEYWORDS = [
     "fomc", "federal funds rate", "interest rate decision",
     "non-farm payroll", "nfp", "consumer price index", "cpi",
@@ -69,7 +70,6 @@ _HIGH_IMPACT_KEYWORDS = [
     "ism manufacturing", "ism non-manufacturing"
 ]
 
-# Geopolitical keywords to filter out from calendar briefing
 GEOPOLITICAL_KEYWORDS = [
     "trump", "iran", "hormuz", "war", "missile", "strike", "attack",
     "geopolitical", "oil supply", "ukraine", "russia", "biden", "putin", "xi"
@@ -80,14 +80,11 @@ def _is_fomc_event(name: str) -> bool:
     return any(kw in n for kw in _FOMC_KEYWORDS)
 
 def _is_reminder_eligible(event: dict) -> bool:
-    # Only red impact
     if event.get("impact") != "red":
         return False
     name_lower = event.get("name", "").lower()
-    # Exclude geopolitical events (no reminder for these)
     if any(kw in name_lower for kw in GEOPOLITICAL_KEYWORDS):
         return False
-    # Only high-impact economic events
     for kw in _HIGH_IMPACT_KEYWORDS:
         if kw in name_lower:
             return True
@@ -139,9 +136,6 @@ def _normalise_urls(text: str) -> str:
     return re.sub(pattern, '', text)
 
 def _extract_events_from_ff_text(text: str) -> List[dict]:
-    """
-    Extract events from AI‑generated calendar text, group same time, convert to 24h.
-    """
     events = []
     pattern = re.compile(r"(🔴|🟠)\s+(\d{1,2}:\d{2}\s+[AP]M)\s*\|\s*([A-Z]{3}):\s*(.+)")
     for line in text.splitlines():
@@ -163,7 +157,6 @@ def _extract_events_from_ff_text(text: str) -> List[dict]:
                 "forecast": "—",
                 "previous": "—",
             })
-    # Group same time (by time_24h) – combine names with commas
     grouped = {}
     for e in events:
         key = (e["time_24h"], e["impact"], e["currency"])
@@ -376,24 +369,19 @@ class ChannelScraper:
             except Exception as exc:
                 log.warning(f"Image download failed: {exc}")
 
-        # ForexFactory calendar route
         if image_data and (_looks_like_ff_image(text) or await self._image_looks_like_ff(image_data, image_mime)):
             is_weekly = _looks_like_weekly(text)
             await self._handle_ff_image(image_data, image_mime, text, is_weekly, source_channel, msg.id)
             return
 
-        # Regular news with duplicate prevention
         content_hash = self._mem.hash_combined(text, image_data)
-
         if await self._mem.is_duplicate(content_hash):
             log.info(f"[SKIP] Exact hash duplicate — {content_hash[:12]}…")
             return
-
         if phash and await self._mem.is_image_duplicate(phash, max_distance=3):
             log.info(f"[SKIP] Image phash duplicate (Hamming ≤3) — {phash}")
             await self._mem.mark_image_seen(phash, source_channel)
             return
-
         if await self._is_similar_to_recent(text, image_data, phash):
             log.info(f"[SKIP] Duplicate detected (event name match or AI similarity).")
             await self._mem.mark_seen(content_hash, source=source_channel)
@@ -477,11 +465,9 @@ class ChannelScraper:
             week_end = week_start + timedelta(days=4)
             week_range = f"{week_start.strftime('%b %d')} – {week_end.strftime('%b %d, %Y')}"
             week_key = now.strftime("%Y-%W")
-
             if await self._mem.has_weekly_posted(week_key):
                 log.info(f"[SKIP] Weekly calendar already posted this week ({week_key}).")
                 return
-
             log.info("📆 Weekly FF image detected — analysing …")
             result = await self._ai.analyse_ff_image(image_data, image_mime, today_date=today_display,
                                                      is_weekly=True, week_range=week_range)
@@ -515,7 +501,7 @@ class ChannelScraper:
 
             events = _extract_events_from_ff_text(post_text)
 
-            # --- Filter out geopolitical events from the calendar briefing ---
+            # Filter out geopolitical events
             filtered_events = []
             for e in events:
                 name_lower = e.get("name", "").lower()
@@ -524,11 +510,9 @@ class ChannelScraper:
                     continue
                 filtered_events.append(e)
             events = filtered_events
-
             if not events:
                 log.info("All events were geopolitical – skipping daily briefing.")
                 return
-            # ----------------------------------------------------------------
 
             self._todays_vip_events = self._select_vip_events(events)
             log.info(f"VIP reminder slots: {[e.get('name') for e in self._todays_vip_events]}")
@@ -547,7 +531,7 @@ class ChannelScraper:
                     footer.append(line)
             event_lines = []
             for e in events:
-                emoji = "🔴" if e.get("impact") == "red" else "🟠"
+                emoji = "🔴" if e["impact"] == "red" else "🟠"
                 event_lines.append(f"{emoji} {e['time_12h']} | {e['currency']}: {e['name']}")
             new_calendar_text = "\n".join(header + event_lines + footer)
             post_text = new_calendar_text
@@ -622,6 +606,9 @@ class ChannelScraper:
             except ValueError:
                 continue
             minutes_until = (event_time - now_naive).total_seconds() / 60
+            if minutes_until < 0:
+                log.info(f"Event {event.get('name')} already passed, skipping reminder")
+                continue
             log.info(f"⏰ Pre-reminder: {event.get('name')} at {event.get('time_12h')} - {minutes_until:.0f} minutes from now")
             if 9 <= minutes_until <= 11:
                 minutes_left = int(round(minutes_until))
