@@ -1,10 +1,5 @@
 """
-ai_engine.py — Final version.
-- Calendar posts: NO hashtags, no year, only USD, 12‑hour AM/PM.
-- Rejects calendar images with >3 non‑USD events (full calendar).
-- News posts: dynamic hashtags (#XAUUSD, #DXY, #OIL) based on affected assets.
-- Allows actual released numbers, bans forecast/previous/TA/signals.
-- Geopolitical and FOMC exceptions.
+ai_engine.py — Final version with professional motivational lines.
 """
 
 import asyncio
@@ -138,7 +133,6 @@ Respond with JSON: {{"same_story": true, "confidence": 0.0-1.0, "reason": "..."}
 """
 
 # ─── FOREXFACTORY PROMPTS (ONLY USD, 12‑hour AM/PM, NO YEAR, NO HASHTAGS) ────
-# This prompt now includes a check for non‑USD event count (>3 → reject)
 _FF_IMAGE_PROMPT = """
 You are analysing a ForexFactory economic calendar screenshot.
 
@@ -148,7 +142,7 @@ TASKS:
 1. Confirm this is a real ForexFactory calendar image (not meme/chart).
 2. Confirm it shows TODAY's date – reject otherwise.
 3. **Count the number of non‑USD event rows** visible (events where the currency is not USD, e.g., EUR, GBP, JPY, etc.).
-   - If there are **more than 3** non‑USD events → reject the image (set approved=false).
+   - If there are **more than 3** non‑USD events → reject the image.
    - If there are 0–3 non‑USD events, proceed.
 4. Extract **only USD high‑impact (Red 🔴) and medium‑impact (Orange 🟠) events** visible.
 5. **Keep the original time as shown in the screenshot** – do NOT convert time zones.
@@ -194,34 +188,34 @@ Otherwise {{"approved": false, "reason": "..."}}
 RESPOND WITH VALID JSON ONLY.
 """.strip()
 
+# Alert template without "NEWS:" header – professional style
 _ALERT_PROMPT_TEMPLATE = """
 You are a Senior Institutional Trader writing a pre-event warning alert.
 
 STRICT RULES:
 - NO asterisks or markdown – plain text only
 - English only
-- Say NEWS: not EVENT:
+- Do NOT include "NEWS:" or any similar label
 - Do NOT include Forecast or Previous
 - Do NOT add NOTE or commentary
 - Do NOT add signature
-- Copy the motivational closing line exactly
+- The alert must be short, direct, and focused on capital protection.
 
-News details:
+Event details:
 Name: {event_name}
-Currency: {currency}
 Time: {time_12h}
 Impact: {impact_emoji}
 Minutes left: {minutes_left}
 
-Motivational closing line (copy exactly):
+Motivational line (copy exactly):
 {motivational_line}
 
 Write EXACT format:
 
 🚨 ALERT: {minutes_left} MINUTES REMAINING
 
-NEWS: {impact_emoji} {event_name}
-TIME: {time_12h}
+{impact_emoji} {event_name}
+🕒 {time_12h}
 
 REQUIRED ACTION:
 ✅ Secure open profits now
@@ -245,31 +239,58 @@ def _add_signature(text: str) -> str:
         text += CHANNEL_SIGNATURE
     return text
 
-_MOTIVATIONAL_POOL = [
-    "🛡️ Guard your account like it is your last one — because one day, it might be. Stay safe. 🔒",
-    "💰 Your account is everything. One reckless trade during news can erase weeks of work. 🚫",
-    "🔒 Do not risk more than you can afford to lose right now. Protect your balance first. 💡",
-    "⚠️ Be careful — this is a high-risk moment. Reduce your size or stay out completely. 🛑",
-    "🧘 Calm traders keep their accounts. Emotional traders lose them. Breathe and be careful. 💎",
-    "📵 Step away from the chart if you feel the urge to gamble. Your account will thank you. 🙏",
-    "💳 Treat every dollar in your account as irreplaceable. Getting it back is twice as hard. 📊",
-    "🔐 A protected account is a surviving account. A surviving account is a winning account. ✅",
-    "🚨 Be careful — news spikes destroy unprotected accounts in seconds. Still be here tomorrow. 📅",
-    "🧠 The best thing you can do right now is nothing. Be careful and wait for clarity. ⏳",
-    "💵 Never let one news event define your month. Keep your risk small and live to trade again. 🗓️",
-    "🛡️ Move your stop to break-even. Lock in your safety. Your account matters more than this trade. 🔑",
-    "📉 A 20% loss needs a 25% gain to recover. Be careful — protect what you have. 📈",
-    "🚫 Do not add to a losing position during news. That is how accounts go to zero. Be careful. ✋",
-    "💡 Traders who protect their accounts during news events are the ones still trading next year. 🏆",
-    "⏸️ If you have no stop loss right now — close the trade. No exceptions. Be careful. 🔒",
-    "🙅 Revenge trading after a news spike is dangerous. Take a break. Be careful with your account. 🛡️",
-    "📌 Account survival is the number one priority. Everything else comes after. Be careful. 💯",
-    "🔴 Be careful — one wrong move right now can hurt your account badly. Stay disciplined. ⚠️",
-    "💰 You worked hard for every dollar in that account. Be careful and do not give it away. 🛡️",
-]
-
-def _get_motivational_line(index: int = 0) -> str:
-    return _MOTIVATIONAL_POOL[index % len(_MOTIVATIONAL_POOL)]
+# ========== PROFESSIONAL MOTIVATIONAL LINES ==========
+def _get_motivational_line(event_name: str = "", fallback_index: int = 0) -> str:
+    """
+    Returns a motivational line tailored to the event type.
+    All lines are professional, capital-protection focused.
+    """
+    name_lower = event_name.lower()
+    
+    # FOMC / Fed related
+    if any(kw in name_lower for kw in ["fomc", "federal funds", "interest rate", "fed chair", "powell", "federal reserve"]):
+        return "🏦 The Fed holds the keys – rate decisions can trigger violent moves. Protect your capital and respect the uncertainty."
+    
+    # Non-Farm Payrolls / Jobs
+    if any(kw in name_lower for kw in ["non-farm", "nfp", "employment change", "payrolls", "jobless", "unemployment"]):
+        return "📊 Jobs data regularly causes 50‑100 pip spikes. Don't gamble – secure profits and wait for clarity."
+    
+    # CPI / PCE / Inflation
+    if any(kw in name_lower for kw in ["cpi", "consumer price", "inflation", "pce"]):
+        return "📈 Inflation surprises can shred stops in seconds. Be extremely cautious – reduce size or stay flat."
+    
+    # GDP
+    if "gdp" in name_lower:
+        return "📉 GDP releases often create sharp two‑way reversals. Tighten your risk management or stay aside."
+    
+    # Geopolitical / Oil / War / Trump
+    if any(kw in name_lower for kw in ["oil", "hormuz", "war", "iran", "trump", "geopolitical", "missile", "attack", "strike"]):
+        return "🌍 Geopolitical spikes are fast and unforgiving. Move to safety – no new entries, protect what you have."
+    
+    # Fallback pool – rotating, still professional
+    general_pool = [
+        "🛡️ Market volatility ahead. Guard your account like it's irreplaceable – because it is. Stay safe. 🔒",
+        "💰 One reckless trade during high‑impact news can erase weeks of gains. Be disciplined.",
+        "🔒 High uncertainty – reduce size or stay out completely. Your first job is capital preservation.",
+        "⚠️ This release is known for whipsaws. Move stops to break‑even and wait for the dust to settle.",
+        "🧘 Professional traders protect first, chase later. Be calm and cautious.",
+        "📵 Step away from the screen if you feel the urge to gamble. Your account will thank you.",
+        "💳 Every dollar in your account is hard‑earned. Do not give it away on unpredictable spikes.",
+        "🔐 A protected account is a surviving account. Surviving accounts eventually win.",
+        "🚨 News spikes destroy unprepared accounts in seconds. Stay careful and live to trade another day.",
+        "🧠 The best action during uncertainty is often no action at all. Wait for clarity.",
+        "💵 Never let one news event define your month. Keep risk small and trade another day.",
+        "🛡️ Lock in safety: move stops to break‑even, reduce leverage, and stay alert.",
+        "📉 A 20% loss requires a 25% gain to recover. Protect what you have.",
+        "🚫 Never add to a losing position during news. This is how accounts go to zero.",
+        "💡 Traders who protect their capital during news events are the ones still trading next year.",
+        "⏸️ If you have no stop loss, close the trade now. No exceptions.",
+        "🙅 Revenge trading after a spike is dangerous. Take a break. Protect your account.",
+        "📌 Account survival is the number one priority. Everything else is secondary.",
+        "🔴 Be careful – one wrong move right now can hurt your account badly. Stay disciplined.",
+        "💰 You worked hard for every dollar. Do not give it away to unpredictable volatility.",
+    ]
+    return general_pool[fallback_index % len(general_pool)]
 
 def _parse_json(raw: str) -> dict:
     if not raw:
@@ -477,10 +498,10 @@ class AIEngine:
 
     async def generate_alert(self, event: dict, minutes_left: int, motivational_index: int = 0) -> str:
         impact_emoji = "🔴" if event.get("impact") == "red" else "🟠"
-        motivational_line = _get_motivational_line(motivational_index)
+        event_name = event.get("name", "Unknown Event")
+        motivational_line = _get_motivational_line(event_name, motivational_index)
         prompt = _ALERT_PROMPT_TEMPLATE.format(
-            event_name=event.get("name", "Unknown Event"),
-            currency=event.get("currency", "USD"),
+            event_name=event_name,
             time_12h=event.get("time_12h", "—"),
             impact_emoji=impact_emoji,
             minutes_left=minutes_left,
@@ -488,7 +509,7 @@ class AIEngine:
         )
         try:
             result = await asyncio.wait_for(self._gemini_text_call(prompt), timeout=30)
-            log.info(f"Alert generated for: {event.get('name')} ({minutes_left} min)")
+            log.info(f"Alert generated for: {event_name} ({minutes_left} min)")
             result = _add_us_flag_emoji(result)
             return _add_signature(_strip_asterisks(result.strip()))
         except Exception as exc:
@@ -500,6 +521,10 @@ class AIEngine:
         except Exception as exc:
             log.error(f"Both engines failed for alert — using fallback.")
             return self._fallback_alert(event, minutes_left, motivational_index)
+
+    async def get_motivational_line(self, event_name: str, fallback_index: int = 0) -> str:
+        """Public method for scraper to get motivational line based on event type."""
+        return _get_motivational_line(event_name, fallback_index)
 
     def _build_moderation_prompt(self, text: str) -> str:
         return textwrap.dedent(f"""
@@ -552,11 +577,12 @@ class AIEngine:
     @staticmethod
     def _fallback_alert(event: dict, minutes_left: int, motivational_index: int = 0) -> str:
         emoji = "🔴" if event.get("impact") == "red" else "🟠"
-        line = _get_motivational_line(motivational_index)
+        event_name = event.get("name", "Unknown Event")
+        line = _get_motivational_line(event_name, motivational_index)
         text = (
             f"🚨 ALERT: {minutes_left} MINUTES REMAINING\n\n"
-            f"NEWS: {emoji} {event.get('name', 'Unknown Event')}\n"
-            f"TIME: {event.get('time_12h', '—')}\n\n"
+            f"{emoji} {event_name}\n"
+            f"🕒 {event.get('time_12h', '—')}\n\n"
             f"REQUIRED ACTION:\n"
             f"✅ Secure open profits now\n"
             f"✅ Move Stop-Loss to Break-even\n"
