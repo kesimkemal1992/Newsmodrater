@@ -166,16 +166,16 @@ class MemoryManager:
         """)
         await self._db.commit()
 
-    async def get_recent_posts(self, limit: int = 150) -> List[Tuple[str, Optional[str]]]:
+    async def get_recent_posts(self, limit: int = 150) -> List[Tuple[str, Optional[str], str]]:
         async with self._db.execute(
-            "SELECT source_text, image_phash FROM recent_posts ORDER BY id DESC LIMIT ?", (limit,)
+            "SELECT source_text, image_phash, created_at FROM recent_posts ORDER BY id DESC LIMIT ?", (limit,)
         ) as cur:
             rows = await cur.fetchall()
-        return [(row["source_text"], row["image_phash"]) for row in rows]
+        return [(row["source_text"], row["image_phash"], row["created_at"]) for row in rows]
 
     async def get_recent_post_texts(self, limit: int = 150) -> List[str]:
         posts = await self.get_recent_posts(limit)
-        return [text for text, _ in posts]
+        return [text for text, _, _ in posts]
 
     async def log_posted(self, source_channel: str, source_msg_id: int, dest_msg_id: int,
                          content_hash: str, ai_verdict: dict, formatted_text: str):
