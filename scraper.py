@@ -1,9 +1,11 @@
 """
 scraper.py — AXIOM INTEL channel scraper and forwarder.
-- Groups same‑time events with commas.
-- Blank line after date line.
-- Negative minutes skip.
-- Geopolitical filtering from calendar.
+- Groups same‑time events (red+orange) into one line.
+- Blank lines after title and after date.
+- No "Be careful" line.
+- Geopolitical events filtered out.
+- Reminders with exact minutes (9‑11 min window).
+- Strong duplicate protection.
 """
 
 import asyncio
@@ -135,7 +137,8 @@ def _normalise_urls(text: str) -> str:
 
 def _extract_events_from_ff_text(text: str) -> List[dict]:
     """
-    Extract events from AI‑generated calendar text and group same time with commas.
+    Extract events from AI‑generated calendar text and group by time.
+    If at least one red event at a time, the whole line becomes red.
     """
     events = []
     pattern = re.compile(r"(🔴|🟠)\s+(\d{1,2}:\d{2}\s+[AP]M)\s*\|\s*([A-Z]{3}):\s*(.+)")
@@ -157,20 +160,36 @@ def _extract_events_from_ff_text(text: str) -> List[dict]:
                 "time_24h": time_24h,
                 "forecast": "—",
                 "previous": "—",
+                "emoji": emoji
             })
-    # Group by (time_24h, impact, currency)
+    # Group by time_24h
     grouped = {}
     for e in events:
-        key = (e["time_24h"], e["impact"], e["currency"])
+        key = e["time_24h"]
         if key not in grouped:
-            grouped[key] = e.copy()
-            grouped[key]["name"] = [e["name"]]
+            grouped[key] = {
+                "time_12h": e["time_12h"],
+                "impact": e["impact"],
+                "currency": e["currency"],
+                "names": [e["name"]],
+                "has_red": e["impact"] == "red"
+            }
         else:
-            grouped[key]["name"].append(e["name"])
+            grouped[key]["names"].append(e["name"])
+            if e["impact"] == "red":
+                grouped[key]["has_red"] = True
+                grouped[key]["impact"] = "red"
     result = []
-    for key, e in grouped.items():
-        e["name"] = ", ".join(e["name"]) if isinstance(e["name"], list) else e["name"]
-        result.append(e)
+    for key, g in grouped.items():
+        result.append({
+            "name": ", ".join(g["names"]),
+            "currency": "USD",
+            "impact": "red" if g["has_red"] else "orange",
+            "time_12h": g["time_12h"],
+            "time_24h": key,
+            "forecast": "—",
+            "previous": "—",
+        })
     return result
 
 class ChannelScraper:
@@ -451,105 +470,6 @@ class ChannelScraper:
             log.warning(f"Similarity check error: {exc}")
         return False
 
-    async def _handle_ff_image(self, image_data: bytes, image_mime: str, caption: str,
-                               is_weekly: bool, source_channel: str, msg_id: int):
-        today_str = _eat_today_str()
-        today_display = _eat_today_display()
-
-        phash = self._mem.compute_phash(image_data)
-        if phash and await self._mem.is_image_duplicate(phash, max_distance=3):
-            log.info(f"[SKIP] FF image duplicate (phash distance ≤3) — {phash}")
-            return
-
-        if is_weekly:
-            now = _eat_now()
-            week_start = now + timedelta(days=(7 - now.weekday()))
-            week_end = week_start + timedelta(days=4)
-            week_range = f"{week_start.strftime('%b %d')} – {week_end.strftime('%b %d, %Y')}"
-            week_key = now.strftime("%Y-%W")
-            if await self._mem.has_weekly_posted(week_key):
-                log.info(f"[SKIP] Weekly calendar already posted this week ({week_key}).")
-                return
-            log.info("📆 Weekly FF image detected — analysing …")
-            result = await self._ai.analyse_ff_image(image_data, image_mime, today_date=today_display,
-                                                     is_weekly=True, week_range=week_range)
-            if not result.get("approved"):
-                log.info(f"[SKIP] Weekly FF image rejected: {result.get('reason')}")
-                return
-            post_text = result.get("formatted_text", "").strip()
-            if not post_text:
-                return
-            post_text = _add_signature(post_text)
-            sent = await self._broadcast_file_with_caption(image_data, image_mime, post_text)
-            if sent:
-                await self._mem.save_weekly_posted(week_key)
-                if phash:
-                    await self._mem.mark_image_seen(phash, source_channel)
-                log.info(f"📆 Weekly calendar posted → msg_id={sent.id}")
-        else:
-            if await self._mem.has_daily_briefing(today_str):
-                log.info(f"[SKIP] Daily briefing already posted today ({today_str}).")
-                return
-
-            log.info("📅 Daily FF image detected — analysing …")
-            result = await self._ai.analyse_ff_image(image_data, image_mime, today_date=today_display, is_weekly=False)
-            if not result.get("approved"):
-                log.info(f"[SKIP] Daily FF image rejected: {result.get('reason')}")
-                return
-            post_text = result.get("formatted_text", "").strip()
-            if not post_text:
-                return
-            post_text = _add_signature(post_text)
-
-            events = _extract_events_from_ff_text(post_text)
-
-            # Filter out geopolitical events
-            filtered_events = []
-            for e in events:
-                name_lower = e.get("name", "").lower()
-                if any(kw in name_lower for kw in GEOPOLITICAL_KEYWORDS):
-                    log.info(f"Removing geopolitical event from calendar: {e.get('name')}")
-                    continue
-                filtered_events.append(e)
-            events = filtered_events
-            if not events:
-                log.info("All events were geopolitical – skipping daily briefing.")
-                return
-
-            self._todays_vip_events = self._select_vip_events(events)
-            log.info(f"VIP reminder slots: {[e.get('name') for e in self._todays_vip_events]}")
-
-            # Rebuild calendar text with grouping and blank line after date
-            lines = post_text.split('\n')
-            header = []
-            footer = []
-            in_events = False
-            for line in lines:
-                if line.startswith(("🔴", "🟠")):
-                    in_events = True
-                if not in_events and line.strip():
-                    header.append(line)
-                if line.startswith("Be careful") or line.startswith("#") or line.startswith("💡") or line.startswith("[Squad"):
-                    footer.append(line)
-            # Ensure a blank line after the date line (the first line of header)
-            if header:
-                # Insert blank line after first line (date)
-                new_header = [header[0], ""] + header[1:]
-                header = new_header
-            event_lines = []
-            for e in events:
-                emoji = "🔴" if e["impact"] == "red" else "🟠"
-                event_lines.append(f"{emoji} {e['time_12h']} | {e['currency']}: {e['name']}")
-            new_calendar_text = "\n".join(header + event_lines + footer)
-            post_text = new_calendar_text
-
-            sent = await self._broadcast_file_with_caption(image_data, image_mime, post_text)
-            if sent:
-                await self._mem.save_daily_briefing(today_str, sent.id, events)
-                if phash:
-                    await self._mem.mark_image_seen(phash, source_channel)
-                log.info(f"📅 Daily briefing posted → msg_id={sent.id}")
-
     async def _image_looks_like_ff(self, image_data: bytes, image_mime: str) -> bool:
         try:
             prompt = "Is this image a ForexFactory.com economic calendar screenshot? Respond with JSON: {\"is_ff\": true} or {\"is_ff\": false}"
@@ -670,3 +590,99 @@ class ChannelScraper:
             except Exception as exc:
                 log.error(f"Reminder dispatcher error: {exc}", exc_info=True)
             await asyncio.sleep(60)
+
+    async def _handle_ff_image(self, image_data: bytes, image_mime: str, caption: str,
+                               is_weekly: bool, source_channel: str, msg_id: int):
+        today_str = _eat_today_str()
+        today_display = _eat_today_display()
+
+        phash = self._mem.compute_phash(image_data)
+        if phash and await self._mem.is_image_duplicate(phash, max_distance=3):
+            log.info(f"[SKIP] FF image duplicate (phash distance ≤3) — {phash}")
+            return
+
+        if is_weekly:
+            now = _eat_now()
+            week_start = now + timedelta(days=(7 - now.weekday()))
+            week_end = week_start + timedelta(days=4)
+            week_range = f"{week_start.strftime('%b %d')} – {week_end.strftime('%b %d, %Y')}"
+            week_key = now.strftime("%Y-%W")
+            if await self._mem.has_weekly_posted(week_key):
+                log.info(f"[SKIP] Weekly calendar already posted this week ({week_key}).")
+                return
+            log.info("📆 Weekly FF image detected — analysing …")
+            result = await self._ai.analyse_ff_image(image_data, image_mime, today_date=today_display,
+                                                     is_weekly=True, week_range=week_range)
+            if not result.get("approved"):
+                log.info(f"[SKIP] Weekly FF image rejected: {result.get('reason')}")
+                return
+            post_text = result.get("formatted_text", "").strip()
+            if not post_text:
+                return
+            post_text = _add_signature(post_text)
+            sent = await self._broadcast_file_with_caption(image_data, image_mime, post_text)
+            if sent:
+                await self._mem.save_weekly_posted(week_key)
+                if phash:
+                    await self._mem.mark_image_seen(phash, source_channel)
+                log.info(f"📆 Weekly calendar posted → msg_id={sent.id}")
+        else:
+            if await self._mem.has_daily_briefing(today_str):
+                log.info(f"[SKIP] Daily briefing already posted today ({today_str}).")
+                return
+
+            log.info("📅 Daily FF image detected — analysing …")
+            result = await self._ai.analyse_ff_image(image_data, image_mime, today_date=today_display, is_weekly=False)
+            if not result.get("approved"):
+                log.info(f"[SKIP] Daily FF image rejected: {result.get('reason')}")
+                return
+            post_text = result.get("formatted_text", "").strip()
+            if not post_text:
+                return
+            post_text = _add_signature(post_text)
+
+            events = _extract_events_from_ff_text(post_text)
+
+            # Filter out geopolitical events
+            filtered_events = []
+            for e in events:
+                name_lower = e.get("name", "").lower()
+                if any(kw in name_lower for kw in GEOPOLITICAL_KEYWORDS):
+                    log.info(f"Removing geopolitical event from calendar: {e.get('name')}")
+                    continue
+                filtered_events.append(e)
+            events = filtered_events
+            if not events:
+                log.info("All events were geopolitical – skipping daily briefing.")
+                return
+
+            self._todays_vip_events = self._select_vip_events(events)
+            log.info(f"VIP reminder slots: {[e.get('name') for e in self._todays_vip_events]}")
+
+            # Rebuild the calendar text with blank lines and grouped events
+            # Use the AI output's first line as title, then add our own date line and events
+            lines = post_text.split('\n')
+            title = lines[0].strip() if lines else "📅 TODAY'S USD HIGH IMPACT NEWS"
+            # Ensure US flag is present (already added by ai_engine)
+            # Build final text
+            output = []
+            output.append(title)
+            output.append("")  # blank line after title
+            # Date line: use current date (day and month only)
+            date_str = _eat_today_display().replace(str(_eat_now().year), "").strip()
+            output.append(date_str)
+            output.append("")  # blank line after date
+            # Add event lines (already grouped by _extract_events_from_ff_text)
+            for e in events:
+                emoji = "🔴" if e["impact"] == "red" else "🟠"
+                output.append(f"{emoji} {e['time_12h']} | {e['currency']}: {e['name']}")
+            # No "Be careful" line
+            post_text = "\n".join(output)
+            post_text = _add_signature(post_text)
+
+            sent = await self._broadcast_file_with_caption(image_data, image_mime, post_text)
+            if sent:
+                await self._mem.save_daily_briefing(today_str, sent.id, events)
+                if phash:
+                    await self._mem.mark_image_seen(phash, source_channel)
+                log.info(f"📅 Daily briefing posted → msg_id={sent.id}")
