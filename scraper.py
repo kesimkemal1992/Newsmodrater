@@ -1,11 +1,10 @@
 """
 scraper.py — AXIOM INTEL channel scraper and forwarder.
-- Groups same‑time events (red+orange) into one line.
+- Groups same‑time events (red+orange) into a single line.
 - Blank lines after title and after date.
 - No "Be careful" line.
 - Geopolitical events filtered out.
-- Reminders with exact minutes (9‑11 min window).
-- Strong duplicate protection.
+- Date without trailing comma and without year.
 """
 
 import asyncio
@@ -16,7 +15,7 @@ import mimetypes
 import random
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List
 
 import pytz
 from telethon import TelegramClient
@@ -158,9 +157,6 @@ def _extract_events_from_ff_text(text: str) -> List[dict]:
                 "impact": impact,
                 "time_12h": time_12h.strip(),
                 "time_24h": time_24h,
-                "forecast": "—",
-                "previous": "—",
-                "emoji": emoji
             })
     # Group by time_24h
     grouped = {}
@@ -187,8 +183,6 @@ def _extract_events_from_ff_text(text: str) -> List[dict]:
             "impact": "red" if g["has_red"] else "orange",
             "time_12h": g["time_12h"],
             "time_24h": key,
-            "forecast": "—",
-            "previous": "—",
         })
     return result
 
@@ -659,25 +653,20 @@ class ChannelScraper:
             self._todays_vip_events = self._select_vip_events(events)
             log.info(f"VIP reminder slots: {[e.get('name') for e in self._todays_vip_events]}")
 
-            # Rebuild the calendar text with blank lines and grouped events
-            # Use the AI output's first line as title, then add our own date line and events
-            lines = post_text.split('\n')
-            title = lines[0].strip() if lines else "📅 TODAY'S USD HIGH IMPACT NEWS"
-            # Ensure US flag is present (already added by ai_engine)
-            # Build final text
-            output = []
-            output.append(title)
-            output.append("")  # blank line after title
-            # Date line: use current date (day and month only)
-            date_str = _eat_today_display().replace(str(_eat_now().year), "").strip()
-            output.append(date_str)
-            output.append("")  # blank line after date
-            # Add event lines (already grouped by _extract_events_from_ff_text)
+            # Build final calendar text with proper spacing and date without trailing comma
+            title = "📅 TODAY'S USD 🇺🇸 HIGH IMPACT NEWS"
+            date_line = _eat_now().strftime("%A, %B %d")   # e.g., "Thursday, April 30"
+            output_lines = [
+                title,
+                "",          # blank line after title
+                date_line,
+                "",          # blank line after date
+            ]
             for e in events:
                 emoji = "🔴" if e["impact"] == "red" else "🟠"
-                output.append(f"{emoji} {e['time_12h']} | {e['currency']}: {e['name']}")
+                output_lines.append(f"{emoji} {e['time_12h']} | {e['currency']}: {e['name']}")
             # No "Be careful" line
-            post_text = "\n".join(output)
+            post_text = "\n".join(output_lines)
             post_text = _add_signature(post_text)
 
             sent = await self._broadcast_file_with_caption(image_data, image_mime, post_text)
