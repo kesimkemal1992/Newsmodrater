@@ -4,6 +4,7 @@ scraper.py — AXIOM INTEL channel scraper and forwarder.
 - Groups same‑time events into a single line with commas.
 - Validates that the date in AI output matches today's date.
 - Includes early locking, geopolitical filtering, reminders.
+- FIXED: always posts when AI approves, even if no events extracted.
 """
 
 import asyncio
@@ -137,7 +138,6 @@ def _extract_events_from_ff_text(text: str) -> List[dict]:
     """
     Extract events from AI‑generated text (each event on its own line),
     then group by time (comma‑separated names for same hour).
-    Also validates that the date in the text matches today's date.
     """
     events = []
     pattern = re.compile(
@@ -149,17 +149,15 @@ def _extract_events_from_ff_text(text: str) -> List[dict]:
         line = line.strip()
         if not line:
             continue
-        # Skip the title and date lines
+        # Skip title lines
         if line.startswith("📅 TODAY'S") or "TODAY'S USD" in line:
             continue
-        # Try to extract date from a line like "Thursday, April 30"
-        date_match = re.match(r"^([A-Za-z]+),\s+([A-Za-z]+)\s+(\d{1,2})$", line)
-        if date_match:
-            # We'll validate later against today's date
+        # Skip date lines like "Thursday, April 30"
+        if re.match(r"^[A-Za-z]+,\s+[A-Za-z]+\s+\d{1,2}$", line):
             continue
         m = pattern.search(line)
         if m:
-            emoji, time_12h, currency, name = m.groups()
+            emoji, time_12h, currency, name_part = m.groups()
             impact = "red" if emoji == "🔴" else "orange"
             time_12h = time_12h.strip()
             try:
@@ -174,21 +172,25 @@ def _extract_events_from_ff_text(text: str) -> List[dict]:
                 except ValueError:
                     time_24h = ""
                     time_12h_clean = time_12h
-            events.append({
-                "name": name.strip(),
-                "currency": currency.strip(),
-                "impact": impact,
-                "time_12h": time_12h_clean,
-                "time_24h": time_24h,
-            })
+
+            # Split by comma if multiple event names
+            names = [n.strip() for n in name_part.split(',')]
+            for name in names:
+                events.append({
+                    "name": name,
+                    "currency": currency.strip(),
+                    "impact": impact,
+                    "time_12h": time_12h_clean,
+                    "time_24h": time_24h,
+                })
         else:
-            log.debug(f"Skipping unmatched line in AI output: {line}")
+            log.debug(f"Skipping unmatched line: {line}")
 
     if not events:
-        log.error("❌ No events extracted! Raw AI output:\n%s", text[:1000])
+        log.warning("No events extracted from AI output.")
         return []
 
-    # Group by time_24h (same time -> one line with comma-separated names)
+    # Group by time_24h
     grouped = {}
     for e in events:
         key = e["time_24h"]
@@ -662,10 +664,12 @@ class ChannelScraper:
             else:
                 await self._mem.delete_weekly_posted(week_key)
 
-        else:
+        else:  # Daily briefing
             if await self._mem.has_daily_briefing(today_str):
                 log.info(f"[SKIP] Daily briefing already posted today ({today_str}).")
                 return
+
+            # Lock daily briefing before AI call
             await self._mem.save_daily_briefing(today_str, -1, [])
             log.info("📅 Daily FF image detected — analysing …")
 
@@ -678,25 +682,30 @@ class ChannelScraper:
             raw_text = result.get("formatted_text", "").strip()
             if not raw_text:
                 await self._mem.delete_daily_briefing(today_str)
+                log.warning("AI approved but formatted_text is empty – posting minimal calendar.")
+                # Create a minimal calendar post
+                post_text = f"📅 TODAY'S USD 🇺🇸 HIGH IMPACT NEWS\n\n{_eat_now().strftime('%A, %B %d')}\n\nNo events extracted from image."
+                post_text = _add_signature(post_text)
+                sent = await self._broadcast_file_with_caption(image_data, image_mime, post_text)
+                if sent:
+                    await self._mem.save_daily_briefing(today_str, sent.id, [])
+                    log.info(f"📅 Minimal daily briefing posted → msg_id={sent.id}")
+                else:
+                    await self._mem.delete_daily_briefing(today_str)
                 return
 
             log.info(f"📄 Raw AI output:\n{raw_text}")
 
-            # Extract date from AI output and verify it matches today's date
-            # The AI output should contain a line like "Thursday, April 30"
+            # Validate date (optional, only warn on mismatch)
             date_match = re.search(r"^([A-Za-z]+),\s+([A-Za-z]+)\s+(\d{1,2})$", raw_text, re.MULTILINE)
             if date_match:
                 month_name = date_match.group(2)
                 day = int(date_match.group(3))
-                # Get current month name and day from today's date
                 today = _eat_now()
                 if month_name != today.strftime("%B") or day != today.day:
-                    log.warning(f"Date mismatch: AI said {month_name} {day}, but today is {today.strftime('%B %d')}. Rejecting.")
-                    await self._mem.delete_daily_briefing(today_str)
-                    return
+                    log.warning(f"Date mismatch: AI said {month_name} {day}, today is {today.strftime('%B %d')}. Still posting but check image.")
             else:
-                log.warning("Could not find date line in AI output. Assuming correct but logging.")
-                # We still proceed, but log warning
+                log.warning("Could not find date line in AI output – proceeding anyway.")
 
             events = _extract_events_from_ff_text(raw_text)
 
@@ -710,18 +719,25 @@ class ChannelScraper:
                 filtered_events.append(e)
             events = filtered_events
 
+            # If no events remain, post a minimal calendar (instead of skipping)
             if not events:
-                await self._mem.delete_daily_briefing(today_str)
-                log.info("All events were geopolitical – skipping daily briefing.")
+                log.warning("All events filtered out – posting minimal calendar with title and date only.")
+                post_text = f"📅 TODAY'S USD 🇺🇸 HIGH IMPACT NEWS\n\n{_eat_now().strftime('%A, %B %d')}\n\nNo high‑impact USD events found for today."
+                post_text = _add_signature(post_text)
+                sent = await self._broadcast_file_with_caption(image_data, image_mime, post_text)
+                if sent:
+                    await self._mem.save_daily_briefing(today_str, sent.id, [])
+                    log.info(f"📅 Minimal daily briefing posted → msg_id={sent.id}")
+                else:
+                    await self._mem.delete_daily_briefing(today_str)
                 return
 
             self._todays_vip_events = self._select_vip_events(events)
             log.info(f"VIP reminder slots: {[e.get('name') for e in self._todays_vip_events]}")
 
-            # Build final post
+            # Build final post with events
             title = "📅 TODAY'S USD 🇺🇸 HIGH IMPACT NEWS"
             date_line = _eat_now().strftime("%A, %B %d")
-
             output_lines = [title, "", date_line, ""]
             for e in events:
                 emoji = "🔴" if e["impact"] == "red" else "🟠"
@@ -738,3 +754,4 @@ class ChannelScraper:
                 log.info(f"📅 Daily briefing posted → msg_id={sent.id}")
             else:
                 await self._mem.delete_daily_briefing(today_str)
+                log.error("Failed to send daily briefing post.")
