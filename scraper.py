@@ -2,7 +2,8 @@
 scraper.py — AXIOM INTEL channel scraper and forwarder.
 - Red events -> HIGH IMPACT NEWS header.
 - Only orange events -> NEWS header.
-- No events -> simple message.
+- No events -> "We don't have high impact news today."
+- Same‑time events grouped with commas.
 """
 
 import asyncio
@@ -671,8 +672,8 @@ class ChannelScraper:
             raw_text = result.get("formatted_text", "").strip()
             if not raw_text:
                 await self._mem.delete_daily_briefing(today_str)
-                # No events → simple message
-                post_text = "No high‑impact USD news for today"
+                # Natural language: no high impact news today
+                post_text = "We don't have high impact news today."
                 post_text = _add_signature(post_text)
                 sent = await self._broadcast_file_with_caption(image_data, image_mime, post_text)
                 if sent:
@@ -708,8 +709,8 @@ class ChannelScraper:
             events = filtered_events
 
             if not events:
-                # No events left → simple message
-                post_text = "No high‑impact USD news for today"
+                # No events left → natural message
+                post_text = "We don't have high impact news today."
                 post_text = _add_signature(post_text)
                 sent = await self._broadcast_file_with_caption(image_data, image_mime, post_text)
                 if sent:
