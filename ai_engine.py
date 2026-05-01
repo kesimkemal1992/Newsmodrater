@@ -1,6 +1,7 @@
 """
 ai_engine.py — Dual-layer AI analysis engine.
-Rejects market sentiment indices (Fear & Greed), preserves original geopolitical text.
+Geopolitical news preserves original source text exactly.
+Rejects market sentiment indices (Fear & Greed, etc.).
 """
 
 import asyncio
@@ -53,6 +54,14 @@ Any statement from a world leader (e.g., Trump, Biden, Putin, Xi) that affects:
 - Gold, USD, or energy markets
 These are HIGH IMPACT geopolitical events, even if posted on social media.
 
+❗ FOR GEOPOLITICAL NEWS:
+- **Keep the original source text EXACTLY as provided** – do NOT change any words, case, punctuation, or order.
+- Do NOT rephrase, do NOT summarise, do NOT clean it.
+- Only add a relevant emoji at the very beginning (choose from 🚨, 🌍, 🗳️, 🛢️, ⚠️).
+- After the original text, add relevant hashtags from #XAUUSD, #DXY, #OIL (only those that apply).
+- Do NOT add any extra commentary or analysis.
+- Do NOT add the signature (it will be added automatically).
+
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 YOUR ONLY JOB:
 Take the source content, verify its relevance, and format it cleanly.
@@ -89,17 +98,19 @@ REJECT IF ANY OF THESE APPLY (EXCEPT the Geopolitical Exception):
 10. PREDICTION   — "I think", "expect", "my analysis" (but actual results are fine)
 11. COMMENTARY   — Personal views, market opinions
 12. FORECAST/PREVIOUS — Any mention of "forecast", "expected", "previous" values
-13. MARKET SENTIMENT INDICES — "Fear & Greed Index", "market sentiment", "greed index", "fear index", "sentiment 67/100"
+13. MARKET SENTIMENT INDICES — "Fear & Greed Index", "market sentiment", "greed index", "fear index", "sentiment XX/XX"
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 FORMAT (if approved):
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-[EMOJI] [SHORT ENGLISH HEADLINE — one line, factual]
+For geopolitical news: [EMOJI] [EXACT ORIGINAL SOURCE TEXT]
+
+[Relevant hashtags from the set #XAUUSD #DXY #OIL – only those that apply]
+
+For economic data (non‑geopolitical): [EMOJI] [SHORT ENGLISH HEADLINE — one line, factual]
 
 [Source content lightly cleaned. 2-4 sentences max.
 Actual numbers are allowed, but never show forecast or previous values.]
-
-[Relevant hashtags from the set #XAUUSD #DXY #OIL – only those that apply]
 
 EMOJI: 🚨 🌍 📊 🏦 🛢️ 🏆 💵 ⚠️ 🗳️
 
@@ -131,7 +142,7 @@ Be aggressive: if there is any reasonable chance they are the same, mark same_st
 Respond with JSON: {{"same_story": true, "confidence": 0.0-1.0, "reason": "..."}}
 """
 
-# ─── FOREXFACTORY PROMPTS (unchanged) ────────────────────────────────────────
+# ========== FOREXFACTORY PROMPTS (unchanged) ==========
 _FF_IMAGE_PROMPT = """
 You are analysing a ForexFactory economic calendar screenshot.
 
