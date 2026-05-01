@@ -1,5 +1,5 @@
 """
-ai_engine.py — Final version with date enforcement and per‑line event extraction.
+ai_engine.py — Final version with retry logic and relaxed date verification.
 """
 
 import asyncio
@@ -139,50 +139,35 @@ Be aggressive: if there is any reasonable chance they are the same, mark same_st
 Respond with JSON: {{"same_story": true, "confidence": 0.0-1.0, "reason": "..."}}
 """
 
-# ========== STRENGTHENED FOREXFACTORY PROMPT ==========
+# ========== STRENGTHENED FOREXFACTORY PROMPT (relaxed date) ==========
 _FF_IMAGE_PROMPT = """
 You are analysing a ForexFactory economic calendar screenshot.
 
-TODAY'S DATE: {today_date}  (this is the REAL today's date – you MUST verify that the calendar shows this exact date)
+TODAY'S DATE: {today_date}  (the year is provided for reference, but do NOT reject if the screenshot only shows day and month. Accept as long as the day and month match.)
 
-CRITICAL INSTRUCTION – READ CAREFULLY:
-1. First, check the date shown in the screenshot. It MUST be exactly `{today_date}` (same month, day, and year).
-   If the screenshot shows ANY other date → REJECT the image immediately.
-
-2. If the date is correct, extract **ALL USD high‑impact (🔴) and medium‑impact (🟠) events** visible.
-   **You MUST list each event on its own line.** Do NOT combine multiple events into one line, even if they share the same time.
-
-3. **DO NOT include the year** in the date line – only day and month (e.g., "Thursday, April 30").
-
-4. **DO NOT add any hashtags** – no #XAUUSD, no #DXY, no #OIL.
-
-5. **NO forecast, NO previous data, NO NOTE line, NO commentary.**
-
-6. **Keep the original time as shown** – only convert to 12‑hour AM/PM if needed.
-
-EXAMPLE of correct output (each event on its own line):
-
-📅 TODAY'S USD HIGH IMPACT NEWS
-Thursday, April 30
-
-🔴 3:30 PM | USD: Advance GDP q/q
-🔴 3:30 PM | USD: Core PCE Price Index m/m
-🔴 3:30 PM | USD: Employment Cost Index q/q
-🟠 5:00 PM | USD: Unemployment Claims
-
-Be careful during these releases.
+CRITICAL INSTRUCTION:
+1. Confirm this is a real ForexFactory calendar image (not meme/chart).
+2. Verify that the date shown in the calendar matches TODAY's **day and month** (year is optional). If the day or month is different → reject.
+3. Extract **ALL USD high‑impact (🔴) and medium‑impact (🟠) events** visible.
+4. **List each event on its own line** – do NOT combine multiple events into one line.
+5. Keep the original time as shown, convert to 12‑hour AM/PM if needed.
+6. Format a clean daily briefing – NO forecast, NO previous data.
+7. DO NOT include the year in the date line (only day and month, e.g., "Thursday, April 30").
+8. DO NOT add any hashtags.
 
 STRICT RULES:
 - Only USD events.
 - Only 🔴 and 🟠 impact.
 - Times in 12‑hour AM/PM, no timezone label.
+- NO forecast values, NO previous values.
+- NO NOTE line, NO commentary.
 - Plain text, no asterisks, no bold.
 - Do NOT add signature.
 
-If the image is not a valid ForexFactory calendar, or if it shows more than 3 non‑USD events, respond with:
+If the image is not a valid ForexFactory calendar, or if the day/month is wrong, respond with:
 {{"approved": false, "reason": "not a valid ForexFactory today image"}}
 
-Otherwise, respond with JSON containing the formatted text exactly as in the example.
+Otherwise, respond with JSON containing the formatted text.
 RESPOND WITH VALID JSON ONLY.
 """.strip()
 
@@ -453,43 +438,74 @@ class AIEngine:
 
     async def analyse_ff_image(self, image_data: bytes, image_mime: str, today_date: str,
                                is_weekly: bool = False, week_range: str = "") -> dict:
+        """Analyse a ForexFactory calendar image with retries and relaxed date verification."""
         if is_weekly:
             prompt = _FF_WEEKLY_IMAGE_PROMPT.format(week_range=week_range)
         else:
             prompt = _FF_IMAGE_PROMPT.format(today_date=today_date)
-        parts = [{"inline_data": {"mime_type": image_mime, "data": _b64(image_data)}}, prompt]
-        try:
-            loop = asyncio.get_event_loop()
-            resp = await asyncio.wait_for(loop.run_in_executor(None, lambda: self._gemini_vision.generate_content(parts)), timeout=45)
-            data = _parse_json(resp.text)
-            log.info(f"FF image → approved={data.get('approved')} | {data.get('reason', '')}")
-            if data.get("approved") and data.get("formatted_text"):
-                data["formatted_text"] = _add_us_flag_emoji(data["formatted_text"])
-            return data
-        except Exception as exc:
-            log.warning(f"Gemini FF failed ({exc}) — trying Groq …")
-        try:
-            content = [
-                {"type": "image_url", "image_url": {"url": f"data:{image_mime};base64,{_b64(image_data)}"}},
-                {"type": "text", "text": prompt},
-            ]
-            resp = await asyncio.wait_for(
-                self._groq.chat.completions.create(
-                    model="meta-llama/llama-4-scout-17b-16e-instruct",
-                    messages=[{"role": "user", "content": content}],
-                    temperature=0.1,
-                    max_tokens=800,
-                ),
-                timeout=60,
-            )
-            data = _parse_json(resp.choices[0].message.content)
-            log.info(f"Groq FF → approved={data.get('approved')}")
-            if data.get("approved") and data.get("formatted_text"):
-                data["formatted_text"] = _add_us_flag_emoji(data["formatted_text"])
-            return data
-        except Exception as exc:
-            log.error(f"Both engines failed for FF image: {exc}")
-            return {"approved": False, "reason": "AI engines unavailable for image analysis."}
+
+        # Try Gemini up to 2 times
+        gemini_attempts = 2
+        for attempt in range(gemini_attempts):
+            try:
+                parts = [{"inline_data": {"mime_type": image_mime, "data": _b64(image_data)}}, prompt]
+                loop = asyncio.get_event_loop()
+                resp = await asyncio.wait_for(
+                    loop.run_in_executor(None, lambda: self._gemini_vision.generate_content(parts)),
+                    timeout=50  # slightly increased
+                )
+                data = _parse_json(resp.text)
+                log.info(f"Gemini FF → approved={data.get('approved')} | {data.get('reason', '')}")
+                if data.get("approved") and data.get("formatted_text"):
+                    data["formatted_text"] = _add_us_flag_emoji(data["formatted_text"])
+                return data
+            except Exception as exc:
+                log.warning(f"Gemini attempt {attempt+1} failed: {exc}")
+                if attempt == gemini_attempts - 1:
+                    log.warning("Gemini failed, falling back to Groq")
+                else:
+                    await asyncio.sleep(2)
+
+        # Try Groq up to 2 times
+        groq_attempts = 2
+        for attempt in range(groq_attempts):
+            try:
+                content = [
+                    {"type": "image_url", "image_url": {"url": f"data:{image_mime};base64,{_b64(image_data)}"}},
+                    {"type": "text", "text": prompt},
+                ]
+                resp = await asyncio.wait_for(
+                    self._groq.chat.completions.create(
+                        model="meta-llama/llama-4-scout-17b-16e-instruct",
+                        messages=[{"role": "user", "content": content}],
+                        temperature=0.1,
+                        max_tokens=800,
+                    ),
+                    timeout=60,
+                )
+                data = _parse_json(resp.choices[0].message.content)
+                log.info(f"Groq FF → approved={data.get('approved')}")
+                if data.get("approved") and data.get("formatted_text"):
+                    data["formatted_text"] = _add_us_flag_emoji(data["formatted_text"])
+                return data
+            except Exception as exc:
+                log.warning(f"Groq attempt {attempt+1} failed: {exc}")
+                if attempt == groq_attempts - 1:
+                    log.error("Both engines failed for FF image analysis.")
+                    # Return a minimal fallback to avoid skipping the post completely
+                    # This will allow the bot to post a calendar with just the date and a generic message.
+                    fallback_date = datetime.now().strftime("%A, %B %d")
+                    fallback_text = f"📅 TODAY'S USD HIGH IMPACT NEWS\n\n{fallback_date}\n\nUnable to extract events from image. Please check the source image."
+                    return {
+                        "approved": True,
+                        "reason": "fallback due to AI engine failure",
+                        "formatted_text": fallback_text,
+                        "confidence": 0.3
+                    }
+                await asyncio.sleep(2)
+
+        # Should never reach here, but defensive:
+        return {"approved": False, "reason": "AI engines unavailable for image analysis."}
 
     async def generate_alert(self, event: dict, minutes_left: int, motivational_index: int = 0) -> str:
         impact_emoji = "🔴" if event.get("impact") == "red" else "🟠"
