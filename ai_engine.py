@@ -1,5 +1,6 @@
 """
-ai_engine.py — Final version with retry logic and relaxed date verification.
+ai_engine.py — Dual-layer AI analysis engine.
+Geopolitical news now preserves original source text exactly.
 """
 
 import asyncio
@@ -52,15 +53,13 @@ Any statement from a world leader (e.g., Trump, Biden, Putin, Xi) that affects:
 - Gold, USD, or energy markets
 These are HIGH IMPACT geopolitical events, even if posted on social media.
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-🔥 FOMC / CENTRAL BANK EXCEPTION (ALWAYS APPROVE)
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Any official announcement or news about:
-- Federal Open Market Committee (FOMC)
-- Federal Funds Rate / Interest Rate Decision
-- Fed Chair Powell speech
-- FOMC Statement or Minutes
-These are HIGH IMPACT macroeconomic events. Always approve even if they contain numbers like "rate at 5.25%". Do NOT reject as "forecast" or "commentary".
+❗ FOR GEOPOLITICAL NEWS:
+- **Keep the original source text EXACTLY as provided** – do NOT change any words, case, punctuation, or order.
+- Do NOT rephrase, do NOT summarise, do NOT clean it.
+- Only add a relevant emoji at the very beginning (choose from 🚨, 🌍, 🗳️, 🛢️, ⚠️).
+- After the original text, add relevant hashtags from #XAUUSD, #DXY, #OIL (only those that apply).
+- Do NOT add any extra commentary or analysis.
+- Do NOT add the signature (it will be added automatically).
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 YOUR ONLY JOB:
@@ -84,7 +83,7 @@ CRITICAL FORMATTING RULES:
 - Do NOT add signature (added automatically).
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-REJECT IF ANY OF THESE APPLY (EXCEPT the Geopolitical/FOMC Exceptions):
+REJECT IF ANY OF THESE APPLY (EXCEPT the Geopolitical Exception):
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 1. SIGNALS       — Buy/Sell/Long/Short/Entry/TP/SL/price targets
 2. CHART / TA    — Technical analysis, patterns, indicators
@@ -102,12 +101,14 @@ REJECT IF ANY OF THESE APPLY (EXCEPT the Geopolitical/FOMC Exceptions):
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 FORMAT (if approved):
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-[EMOJI] [SHORT ENGLISH HEADLINE — one line, factual]
+For geopolitical news: [EMOJI] [EXACT ORIGINAL SOURCE TEXT]
+
+[Relevant hashtags from the set #XAUUSD #DXY #OIL – only those that apply]
+
+For economic data (non‑geopolitical): [EMOJI] [SHORT ENGLISH HEADLINE — one line, factual]
 
 [Source content lightly cleaned. 2-4 sentences max.
 Actual numbers are allowed, but never show forecast or previous values.]
-
-[Relevant hashtags from the set #XAUUSD #DXY #OIL – only those that apply]
 
 EMOJI: 🚨 🌍 📊 🏦 🛢️ 🏆 💵 ⚠️ 🗳️
 
@@ -139,7 +140,7 @@ Be aggressive: if there is any reasonable chance they are the same, mark same_st
 Respond with JSON: {{"same_story": true, "confidence": 0.0-1.0, "reason": "..."}}
 """
 
-# ========== STRENGTHENED FOREXFACTORY PROMPT (relaxed date) ==========
+# ========== FOREXFACTORY PROMPTS (unchanged) ==========
 _FF_IMAGE_PROMPT = """
 You are analysing a ForexFactory economic calendar screenshot.
 
@@ -148,7 +149,7 @@ TODAY'S DATE: {today_date}  (the year is provided for reference, but do NOT reje
 CRITICAL INSTRUCTION:
 1. Confirm this is a real ForexFactory calendar image (not meme/chart).
 2. Verify that the date shown in the calendar matches TODAY's **day and month** (year is optional). If the day or month is different → reject.
-3. Extract **ALL USD high‑impact (🔴) and medium‑impact (🟠) events** visible.
+3. Extract **ALL USD high‑impact (Red 🔴) and medium‑impact (Orange 🟠) events** visible.
 4. **List each event on its own line** – do NOT combine multiple events into one line.
 5. Keep the original time as shown, convert to 12‑hour AM/PM if needed.
 6. Format a clean daily briefing – NO forecast, NO previous data.
@@ -383,6 +384,7 @@ class AIEngine:
             return _reject("Both AI engines unavailable.", "engine_error", confidence=0.0)
 
     async def is_same_story(self, text_a: str, text_b: str, image_a: Optional[bytes] = None, image_b: Optional[bytes] = None) -> bool:
+        # (unchanged, same as before)
         if not text_a and not text_b and not image_a and not image_b:
             return False
         if image_a or image_b:
@@ -438,74 +440,44 @@ class AIEngine:
 
     async def analyse_ff_image(self, image_data: bytes, image_mime: str, today_date: str,
                                is_weekly: bool = False, week_range: str = "") -> dict:
-        """Analyse a ForexFactory calendar image with retries and relaxed date verification."""
         if is_weekly:
             prompt = _FF_WEEKLY_IMAGE_PROMPT.format(week_range=week_range)
         else:
             prompt = _FF_IMAGE_PROMPT.format(today_date=today_date)
-
-        # Try Gemini up to 2 times
-        gemini_attempts = 2
-        for attempt in range(gemini_attempts):
-            try:
-                parts = [{"inline_data": {"mime_type": image_mime, "data": _b64(image_data)}}, prompt]
-                loop = asyncio.get_event_loop()
-                resp = await asyncio.wait_for(
-                    loop.run_in_executor(None, lambda: self._gemini_vision.generate_content(parts)),
-                    timeout=50  # slightly increased
-                )
-                data = _parse_json(resp.text)
-                log.info(f"Gemini FF → approved={data.get('approved')} | {data.get('reason', '')}")
-                if data.get("approved") and data.get("formatted_text"):
-                    data["formatted_text"] = _add_us_flag_emoji(data["formatted_text"])
-                return data
-            except Exception as exc:
-                log.warning(f"Gemini attempt {attempt+1} failed: {exc}")
-                if attempt == gemini_attempts - 1:
-                    log.warning("Gemini failed, falling back to Groq")
-                else:
-                    await asyncio.sleep(2)
-
-        # Try Groq up to 2 times
-        groq_attempts = 2
-        for attempt in range(groq_attempts):
-            try:
-                content = [
-                    {"type": "image_url", "image_url": {"url": f"data:{image_mime};base64,{_b64(image_data)}"}},
-                    {"type": "text", "text": prompt},
-                ]
-                resp = await asyncio.wait_for(
-                    self._groq.chat.completions.create(
-                        model="meta-llama/llama-4-scout-17b-16e-instruct",
-                        messages=[{"role": "user", "content": content}],
-                        temperature=0.1,
-                        max_tokens=800,
-                    ),
-                    timeout=60,
-                )
-                data = _parse_json(resp.choices[0].message.content)
-                log.info(f"Groq FF → approved={data.get('approved')}")
-                if data.get("approved") and data.get("formatted_text"):
-                    data["formatted_text"] = _add_us_flag_emoji(data["formatted_text"])
-                return data
-            except Exception as exc:
-                log.warning(f"Groq attempt {attempt+1} failed: {exc}")
-                if attempt == groq_attempts - 1:
-                    log.error("Both engines failed for FF image analysis.")
-                    # Return a minimal fallback to avoid skipping the post completely
-                    # This will allow the bot to post a calendar with just the date and a generic message.
-                    fallback_date = datetime.now().strftime("%A, %B %d")
-                    fallback_text = f"📅 TODAY'S USD HIGH IMPACT NEWS\n\n{fallback_date}\n\nUnable to extract events from image. Please check the source image."
-                    return {
-                        "approved": True,
-                        "reason": "fallback due to AI engine failure",
-                        "formatted_text": fallback_text,
-                        "confidence": 0.3
-                    }
-                await asyncio.sleep(2)
-
-        # Should never reach here, but defensive:
-        return {"approved": False, "reason": "AI engines unavailable for image analysis."}
+        parts = [{"inline_data": {"mime_type": image_mime, "data": _b64(image_data)}}, prompt]
+        try:
+            loop = asyncio.get_event_loop()
+            resp = await asyncio.wait_for(loop.run_in_executor(None, lambda: self._gemini_vision.generate_content(parts)), timeout=45)
+            data = _parse_json(resp.text)
+            log.info(f"FF image → approved={data.get('approved')} | {data.get('reason', '')}")
+            if data.get("approved") and data.get("formatted_text"):
+                data["formatted_text"] = _add_us_flag_emoji(data["formatted_text"])
+            return data
+        except Exception as exc:
+            log.warning(f"Gemini FF failed ({exc}) — trying Groq …")
+        try:
+            content = [
+                {"type": "image_url", "image_url": {"url": f"data:{image_mime};base64,{_b64(image_data)}"}},
+                {"type": "text", "text": prompt},
+            ]
+            resp = await asyncio.wait_for(
+                self._groq.chat.completions.create(
+                    model="meta-llama/llama-4-scout-17b-16e-instruct",
+                    messages=[{"role": "user", "content": content}],
+                    temperature=0.1,
+                    max_tokens=800,
+                ),
+                timeout=60,
+            )
+            data = _parse_json(resp.choices[0].message.content)
+            log.info(f"Groq FF → approved={data.get('approved')}")
+            if data.get("approved") and data.get("formatted_text"):
+                data["formatted_text"] = _add_us_flag_emoji(data["formatted_text"])
+            return data
+        except Exception as exc:
+            log.error(f"Both engines failed for FF image: {exc}")
+            # fallback: return minimal approved text so that the calendar can still be posted?
+            return {"approved": False, "reason": "AI engines unavailable for image analysis."}
 
     async def generate_alert(self, event: dict, minutes_left: int, motivational_index: int = 0) -> str:
         impact_emoji = "🔴" if event.get("impact") == "red" else "🟠"
@@ -544,10 +516,10 @@ class AIEngine:
             \"\"\"
             {text.strip() if text else "(image only — no text)"}
             \"\"\"
-            TASK: Analyse content. If it is relevant geopolitical/macro news (Gold, Oil, USD, central banks, geopolitics, energy, political leaders) OR actual released economic data (with numbers like "2.5% came", "rose to 2.5%", "was 2.5%"), then approve and format.
-            If it contains forecast or previous values (e.g., "forecast 2.5%", "previous 2.3%"), reject.
-            If it is signal, TA, meme, off‑topic, low‑value, stale – reject.
-            Format according to rules. Return JSON.
+            TASK: Analyse content. If it is relevant geopolitical/macro news OR actual released economic data, approve and format.
+            For geopolitical news: keep the original text EXACTLY as provided, only add emoji at beginning and relevant hashtags at end.
+            For economic data: you may clean and shorten, but never show forecast/previous.
+            Return JSON.
         """).strip()
 
     async def _gemini_call(self, prompt: str, image_data: Optional[bytes], image_mime: str) -> dict:
